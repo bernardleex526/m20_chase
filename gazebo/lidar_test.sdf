@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<sdf version="1.9">
+  <world name="lidar_test">
+    <plugin filename="ignition-gazebo-physics-system" name="ignition::gazebo::systems::Physics"/>
+    <plugin filename="ignition-gazebo-user-commands-system" name="ignition::gazebo::systems::UserCommands"/>
+    <plugin filename="ignition-gazebo-scene-broadcaster-system" name="ignition::gazebo::systems::SceneBroadcaster"/>
+    <plugin filename="ignition-gazebo-sensors-system" name="ignition::gazebo::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <light type="directional" name="sun">
+      <cast_shadows>false</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+    </light>
+    <model name="ground">
+      <static>true</static>
+      <link name="link">
+        <collision name="c"><geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry></collision>
+        <visual name="v"><geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry></visual>
+      </link>
+    </model>
+    <model name="lidar_rig">
+      <pose>0 0 1.0 0 0 0</pose>
+      <link name="link">
+        <sensor name="lidar3d" type="gpu_lidar">
+          <topic>scan</topic>
+          <update_rate>10</update_rate>
+          <lidar>
+            <scan_type>general</scan_type>
+            <min_range>0.1</min_range>
+            <max_range>30</max_range>
+            <vertical><samples>16</samples><min_angle>-15</min_angle><max_angle>15</max_angle></vertical>
+            <horizontal><samples>720</samples><min_angle>-180</min_angle><max_angle>180</max_angle></horizontal>
+          </lidar>
+          <always_on>1</always_on>
+          <visualize>false</visualize>
+        </sensor>
+      </link>
+    </model>
+  </world>
+</sdf>

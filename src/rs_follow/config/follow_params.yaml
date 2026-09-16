@@ -1,0 +1,86 @@
+rs_follow_node:
+  ros__parameters:
+    # --- input / output ---
+    input_topic: "/rslidar_points"
+    cmd_vel_topic: "/cmd_vel"
+    odom_topic: "/odom"          # robot odometry; empty "" disables (falls back to cmd integration)
+    compensate_slip: true        # scale cmd_vel by 1/(actual/cmd) to cancel slip
+    slip_min_ratio: 0.3          # ignore ratio estimates below this
+    slip_max_ratio: 2.5          # clamp on the estimated actual/cmd ratio
+    slip_filter_alpha: 0.1       # low-pass on the ratio estimate
+    slip_min_cmd: 0.05           # only estimate when |cmd| exceeds this
+    max_linear_cmd: 1.5          # safety ceiling on the compensated linear command
+    max_angular_cmd: 2.0         # safety ceiling on the compensated angular command
+    active: false                # safety default; enable via ~/enable or launch active:=true
+    control_rate_hz: 50.0
+    cmd_timeout: 0.5             # publish zero after this long without a scan
+    publish_scan_debug: true
+
+    # --- 3D cloud -> 2D polar scan projection ---
+    height_min: -0.40            # keep returns in this z band (m, lidar frame)
+    height_max: 1.80             # person torso ~ up to 1.8 m above the lidar
+    z_offset: 0.0
+    angle_bins: 1440             # 0.25 deg azimuth resolution
+    range_min: 0.25
+    range_max: 30.0
+    flip_x: false                # set true if the cloud x axis points backwards
+    flip_y: false
+
+    # --- follow target / standoff ---
+    follow_dist: 1.00            # desired distance to the target (m)
+    target_radius: 0.60          # cluster radius around the bound target
+    rectangle_width: 0.50        # corridor width used for lateral centring
+
+    # --- control gains ---
+    k_linear: 2.50
+    k_angular: 1.50
+    k_lateral: 0.80
+    enable_lateral: true         # needs a holonomic base (dog). false -> only vx/wz
+    rotate_in_place_behind: true # if target is behind, rotate without driving forward
+
+    # --- limits / deadbands ---
+    max_linear: 0.90
+    max_angular: 1.00
+    linear_deadband: 0.05
+    angular_deadband: 0.08
+    min_linear_speed: 0.02
+    linear_hysteresis: 0.03     # sticky deadband to avoid on/off chatter
+    angular_hysteresis: 0.03
+    k_integral: 0.30            # integral gain: removes lag on a moving target
+    integral_limit: 1.00        # anti-windup clamp on the integral (m*s)
+
+    # --- output smoothing (applied on the control timer) ---
+    max_linear_accel: 0.80      # m/s^2  (vx, vy)
+    max_angular_accel: 1.50     # rad/s^2 (wz)
+    max_linear_jerk: 8.0        # m/s^3  limit the change of acceleration
+    max_angular_jerk: 20.0      # rad/s^3
+    cmd_filter_alpha: 0.60      # 0 = off; (0,1] first-order low-pass on cmd
+
+    # --- obstacle avoidance (artificial potential field) ---
+    apf_influence: 0.60
+    apf_gain: 0.02
+    apf_emergency: 0.35
+    apf_slowdown: 0.70
+
+    # --- robot self-occlusion box (lidar frame) ---
+    frame_front: 0.25
+    frame_back: 0.45
+    frame_left: 0.25
+    frame_right: 0.25
+
+    # --- target filtering / loss ---
+    enable_kalman: true
+    kalman_q: 0.10
+    kalman_r: 0.05
+    kalman_gate: 6.0           # Mahalanobis gate (sigma); reject outlier clusters
+    kalman_r_ref_points: 80    # nominal cluster size; R scales as n_ref/n_points
+    filter_in_world: true      # filter in an inertial frame (compensate robot rotation)
+    lost_frames_timeout: 30
+
+    # --- automatic front target selection when nothing is bound ---
+    auto_select_front: true
+    auto_front_fov_deg: 40.0
+    auto_select_max_range: 8.0
+
+    # --- manual binding ---
+    bind_radius: 0.60
