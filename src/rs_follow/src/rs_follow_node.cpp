@@ -22,6 +22,7 @@
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 
@@ -76,6 +77,22 @@ public:
       [this](std_msgs::msg::Bool::SharedPtr msg) {
         active_ = msg->data;
         RCLCPP_INFO(get_logger(), "follow %s", active_ ? "ENABLED" : "DISABLED");
+      });
+
+    // direct-control mode (0 = DIRECT joystick, 1 = FOLLOW)
+    mode_sub_ = create_subscription<std_msgs::msg::Int32>(
+      "/rs_follow/control_mode", 10,
+      [this](std_msgs::msg::Int32::SharedPtr msg) {
+        control_mode_ = msg->data;
+        RCLCPP_INFO(get_logger(), "control_mode -> %s",
+                    control_mode_ == 0 ? "DIRECT" : "FOLLOW");
+      });
+    direct_sub_ = create_subscription<geometry_msgs::msg::Twist>(
+      "/rs_follow/direct_cmd", 10,
+      [this](geometry_msgs::msg::Twist::SharedPtr msg) {
+        direct_vx_ = msg->linear.x;
+        direct_vy_ = msg->linear.y;
+        direct_wz_ = msg->angular.z;
       });
 
     cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 10);
@@ -271,18 +288,24 @@ private:
     const double age = (now() - last_cloud_time_).seconds();
     const bool fresh = age < cmd_timeout_;
 
-    geometry_msgs::msg::Twist desired;  // zero unless we have a valid, fresh follow command
+    geometry_msgs::msg::Twist desired;  // zero unless a valid, fresh command exists
     bool emergency = false;
-    if (active_ && fresh && last_result_.target_valid) {
-      if (last_result_.emergency_stop) {
-        emergency = true;
-      } else {
-        desired = last_result_.cmd;
+    if (active_ && fresh) {
+      if (control_mode_ == 0) {                 // DIRECT (joystick)
+        desired.linear.x = direct_vx_;
+        desired.linear.y = direct_vy_;
+        desired.angular.z = direct_wz_;
+      } else if (last_result_.target_valid) {   // FOLLOW
+        if (last_result_.emergency_stop) {
+          emergency = true;
+        } else {
+          desired = last_result_.cmd;
+        }
       }
     }
 
-    // slip / speed compensation: scale the desired actual speed up by 1/ratio
-    if (compensate_slip_ && !emergency) {
+    // slip / speed compensation (follow only)
+    if (compensate_slip_ && !emergency && control_mode_ != 0) {
       desired.linear.x /= lin_ratio_;
       desired.linear.y /= lin_ratio_;
       desired.angular.z /= ang_ratio_;
@@ -378,6 +401,8 @@ private:
   bool last_scan_valid_ = false;
   bool active_ = false;
   bool publish_scan_debug_ = true;
+  int control_mode_ = 1;                       // 0 = DIRECT, 1 = FOLLOW
+  double direct_vx_ = 0.0, direct_vy_ = 0.0, direct_wz_ = 0.0;
   double control_rate_hz_ = 50.0;
   double cmd_timeout_ = 0.5;
   rclcpp::Time last_cloud_time_;
@@ -404,6 +429,8 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr bind_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr clear_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enable_sub_;
+  rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr mode_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr direct_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr scan_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr target_pub_;

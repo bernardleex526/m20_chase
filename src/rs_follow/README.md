@@ -72,7 +72,25 @@ ros2 topic pub --once /rs_follow/bind_target geometry_msgs/msg/PointStamped \
 ros2 topic pub --once /rs_follow/clear_target std_msgs/msg/Bool "{data: true}"
 ```
 
-## Web 选目标（双击，SSH 友好）
+## Web 控制台（jie_deamon 同款）
+
+`web_ui.py` 复用 jie_deamon 的前端（HTML/CSS/图标），并附带自研 WebSocket：
+三个 Tab（直接控制 / 雷达跟随 / 导航）、虚拟摇杆、左右转滑块、高/低速、趴下/站起、
+实时点云画布（双击选目标）、目标 X/Y 与速度指令显示、运动停止开关。
+
+```bash
+ros2 run rs_follow web_ui.py --ros-args -p http_port:=8080 -p ws_port:=8890
+# 浏览器打开 http://<上位机IP>:8080
+```
+
+- **雷达跟随 Tab**：画布双击 → `/rs_follow/bind_target`；开关 → `/rs_follow/enable`
+- **直接控制 Tab**：摇杆/滑块 → `/rs_follow/control_mode=0` + `/rs_follow/direct_cmd`(Twist)
+- **动作按钮**：`/rs_follow/action_cmd`（`liedown`/`standup`）；由 `m20_bridge`（main 分支）转成 M20 `MotionParam`
+- 通信：`ws://<host>:8890` 实时推送状态（~15Hz），另有 `/api/status` REST 兜底
+
+> 另有精简版 `web_target_ui.py`（纯 HTTP 轮询，只做双击选目标），依赖更少。
+
+## Web 目标选取（精简版 `web_target_ui.py`）
 
 `web_target_ui.py` 提供一个浏览器界面：实时画出投影后的 2D 扫描，**双击画布**即可
 绑定目标（发布到 `/rs_follow/bind_target`），并有「清除目标 / 使能」按钮。
