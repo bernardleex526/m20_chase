@@ -72,6 +72,20 @@ ros2 topic pub --once /rs_follow/bind_target geometry_msgs/msg/PointStamped \
 ros2 topic pub --once /rs_follow/clear_target std_msgs/msg/Bool "{data: true}"
 ```
 
+## Web 选目标（双击，SSH 友好）
+
+`web_target_ui.py` 提供一个浏览器界面：实时画出投影后的 2D 扫描，**双击画布**即可
+绑定目标（发布到 `/rs_follow/bind_target`），并有「清除目标 / 使能」按钮。
+
+```bash
+ros2 run rs_follow web_target_ui.py --ros-args -p port:=8080
+# 浏览器打开 http://<上位机IP>:8080
+```
+
+接口：`GET /`（页面）、`GET /state`（JSON 扫描/目标/状态）、`GET /bind?x=&y=`（绑定）、
+`GET /clear`、`GET /enable?on=1`。纯 Python 标准库，无需额外依赖。
+画布坐标：`+x` 向右（机器人正前方），`+y` 向上，每格 1m，虚线圆为 `follow_dist`。
+
 ## 话题
 
 | 方向 | 话题 | 类型 | 说明 |

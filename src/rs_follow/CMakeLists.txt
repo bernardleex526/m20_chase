@@ -43,6 +43,7 @@ install(PROGRAMS
   scripts/control_smoothness_check.py
   scripts/follow_sim_visualize.py
   scripts/follow_pysim.py
+  scripts/web_target_ui.py
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch config docs
