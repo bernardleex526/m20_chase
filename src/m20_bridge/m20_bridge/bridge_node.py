@@ -72,6 +72,7 @@ class M20Bridge(Node):
         self.last_odom_t = time.time()
 
         self.cmd_sub = self.create_subscription(Twist, self.cmd_vel_topic, self._on_cmd, 10)
+        self.act_sub = self.create_subscription(String, '/rs_follow/action_cmd', self._on_action, 10)
         self.odom_pub = self.create_publisher(Odometry, self.odom_topic, 10)
         self.stat_pub = self.create_publisher(String, '~/robot_status', 10)
 
@@ -115,6 +116,16 @@ class M20Bridge(Node):
     def _on_cmd(self, msg):
         self.cmd = (msg.linear.x, msg.linear.y, msg.angular.z)
         self.last_cmd_t = time.time()
+
+    def _on_action(self, msg):
+        a = msg.data.strip().lower()
+        if a in ('liedown', 'lie_down', 'down'):
+            self._send(P.set_motion_state(4))
+        elif a in ('standup', 'stand_up', 'stand', 'up'):
+            self._send(P.set_motion_state(1))
+        elif a in ('softstop', 'estop', 'stop'):
+            self._send(P.set_motion_state(2))
+        self.get_logger().info(f'action -> {a}')
 
     # -- periodic ------------------------------------------------------------ #
     def _heartbeat(self):

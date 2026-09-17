@@ -44,9 +44,11 @@ install(PROGRAMS
   scripts/follow_sim_visualize.py
   scripts/follow_pysim.py
   scripts/web_target_ui.py
+  scripts/web_ui.py
+  scripts/ws_server.py
   DESTINATION lib/${PROJECT_NAME})
 
-install(DIRECTORY launch config docs
+install(DIRECTORY launch config docs web
   DESTINATION share/${PROJECT_NAME})
 
 ament_package()
