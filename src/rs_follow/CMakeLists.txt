@@ -37,6 +37,43 @@ ament_target_dependencies(rs_follow_node
 install(TARGETS rs_follow_node
   DESTINATION lib/${PROJECT_NAME})
 
+# Behavioural test for the safety layer. Runs on synthetic scans with no Gazebo
+# and no ROS runtime, so a safety regression is caught in milliseconds instead
+# of in an eight-minute simulation sweep. Build and run with:
+#     colcon build --packages-select rs_follow --cmake-args -DBUILD_TESTING=ON
+#     ./build/rs_follow/test_safety
+if(BUILD_TESTING)
+  add_executable(test_safety test/test_safety.cpp)
+  target_include_directories(test_safety PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  ament_target_dependencies(test_safety
+    rclcpp
+    sensor_msgs
+    geometry_msgs
+    nav_msgs
+    visualization_msgs
+    std_msgs)
+
+  # Auto-select must pick a person, not a wall (it once locked a trap's back
+  # wall and held station on it while the person stood 4.5 m away).
+  add_executable(test_autoselect test/test_autoselect.cpp)
+  target_include_directories(test_autoselect PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  ament_target_dependencies(test_autoselect
+    rclcpp
+    sensor_msgs
+    geometry_msgs
+    nav_msgs
+    visualization_msgs
+    std_msgs)
+
+  # Prints the speed-vs-clearance curve, so the safety margins are chosen from
+  # numbers instead of by trial and error in simulation.
+  add_executable(test_governor_curve test/test_governor_curve.cpp)
+  target_include_directories(test_governor_curve PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+endif()
+
 install(PROGRAMS
   scripts/pointcloud_status.py
   scripts/follow_scenario_test.py

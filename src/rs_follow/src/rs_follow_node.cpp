@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <memory>
 #include <string>
@@ -29,6 +30,7 @@
 #include "rs_follow/cmd_smoother.hpp"
 #include "rs_follow/follow_controller.hpp"
 #include "rs_follow/pointcloud_scan.hpp"
+#include "rs_follow/recovery_fsm.hpp"
 
 namespace rs_follow
 {
@@ -40,7 +42,10 @@ public:
   : rclcpp::Node("rs_follow_node")
   {
     loadParams();
+    deriveLowBand();
     controller_.setConfig(follow_cfg_);
+    recovery_.setConfig(recovery_cfg_);
+    search_.setConfig(search_cfg_);
     smoother_.setConfig(smoother_cfg_);
 
     auto sensor_qos = rclcpp::SensorDataQoS();
@@ -101,6 +106,7 @@ public:
     target_raw_pub_ = create_publisher<geometry_msgs::msg::PointStamped>("/rs_follow/target_raw", 10);
     status_pub_ = create_publisher<std_msgs::msg::String>("/rs_follow/status", 10);
     marker_pub_ = create_publisher<visualization_msgs::msg::Marker>("/rs_follow/target_marker", 10);
+    state_pub_ = create_publisher<std_msgs::msg::String>("/rs_follow/state", 10);
 
     last_result_ = FollowResult();
     last_cloud_time_ = now();
@@ -118,6 +124,39 @@ public:
   }
 
 private:
+  /**
+   * @brief Derive the LOW obstacle band from the measured lidar height.
+   *
+   * The band must sit strictly ABOVE the floor: ground returns appear at sensor
+   * z = -sensor_height, and a band that includes them fills every azimuth bin
+   * with the floor. When that happens the person is masked out of the target
+   * band (only the nearest return per bin survives) and the lock is lost.
+   */
+  void deriveLowBand()
+  {
+    if (!proj_cfg_.enable_low_band || !follow_cfg_.auto_low_band) {
+      return;
+    }
+    proj_cfg_.low_height_min =
+      -follow_cfg_.sensor_height + follow_cfg_.ground_clearance;
+    // Leave a DEAD ZONE between the bands. With only 0.05 m of separation the
+    // top face of a low obstacle sits close enough to the target band that
+    // range noise carries it over the boundary, where it is clustered as if it
+    // were the person (observed as the tracker binding to a 0.30 m step and the
+    // follow loop then holding station on the obstacle). The dead zone means a
+    // low obstacle is detected by its SIDE faces, which span a range of z and
+    // therefore always cross the band.
+    proj_cfg_.low_height_max = proj_cfg_.height_min - follow_cfg_.band_separation;
+    if (proj_cfg_.low_height_max <= proj_cfg_.low_height_min) {
+      proj_cfg_.low_height_max = proj_cfg_.low_height_min + 0.05;
+    }
+    RCLCPP_INFO(
+      get_logger(),
+      "low band derived: [%.2f, %.2f] m (sensor_height=%.2f, ground_clearance=%.2f)",
+      proj_cfg_.low_height_min, proj_cfg_.low_height_max,
+      follow_cfg_.sensor_height, follow_cfg_.ground_clearance);
+  }
+
   void loadParams()
   {
     input_topic_ = declare_parameter<std::string>("input_topic", "/rslidar_points");
@@ -143,6 +182,12 @@ private:
     proj_cfg_.range_max = declare_parameter<double>("range_max", proj_cfg_.range_max);
     proj_cfg_.flip_x = declare_parameter<bool>("flip_x", proj_cfg_.flip_x);
     proj_cfg_.flip_y = declare_parameter<bool>("flip_y", proj_cfg_.flip_y);
+    proj_cfg_.enable_low_band =
+      declare_parameter<bool>("enable_low_band", proj_cfg_.enable_low_band);
+    proj_cfg_.low_height_min =
+      declare_parameter<double>("low_height_min", proj_cfg_.low_height_min);
+    proj_cfg_.low_height_max =
+      declare_parameter<double>("low_height_max", proj_cfg_.low_height_max);
 
     follow_cfg_.follow_dist = declare_parameter<double>("follow_dist", follow_cfg_.follow_dist);
     follow_cfg_.target_radius = declare_parameter<double>("target_radius", follow_cfg_.target_radius);
@@ -194,7 +239,108 @@ private:
       declare_parameter<double>("auto_front_fov_deg", follow_cfg_.auto_front_fov_deg);
     follow_cfg_.auto_select_max_range =
       declare_parameter<double>("auto_select_max_range", follow_cfg_.auto_select_max_range);
+    follow_cfg_.auto_max_target_width =
+      declare_parameter<double>("auto_max_target_width",
+                                follow_cfg_.auto_max_target_width);
     follow_cfg_.bind_radius = declare_parameter<double>("bind_radius", follow_cfg_.bind_radius);
+    follow_cfg_.exclude_target_from_obstacles =
+      declare_parameter<bool>("exclude_target_from_obstacles",
+                              follow_cfg_.exclude_target_from_obstacles);
+    follow_cfg_.target_exclude_slack =
+      declare_parameter<double>("target_exclude_slack", follow_cfg_.target_exclude_slack);
+    follow_cfg_.direction_gated_obstacles =
+      declare_parameter<bool>("direction_gated_obstacles",
+                              follow_cfg_.direction_gated_obstacles);
+    follow_cfg_.sector_half_angle_deg =
+      declare_parameter<double>("sector_half_angle_deg", follow_cfg_.sector_half_angle_deg);
+    follow_cfg_.robot_length =
+      declare_parameter<double>("robot_length", follow_cfg_.robot_length);
+    follow_cfg_.robot_width =
+      declare_parameter<double>("robot_width", follow_cfg_.robot_width);
+    follow_cfg_.behind_rotate_timeout =
+      declare_parameter<double>("behind_rotate_timeout", follow_cfg_.behind_rotate_timeout);
+    follow_cfg_.auto_frame =
+      declare_parameter<bool>("auto_frame", follow_cfg_.auto_frame);
+    follow_cfg_.self_occlusion_margin =
+      declare_parameter<double>("self_occlusion_margin", follow_cfg_.self_occlusion_margin);
+    follow_cfg_.sensor_height =
+      declare_parameter<double>("sensor_height", follow_cfg_.sensor_height);
+    follow_cfg_.ground_clearance =
+      declare_parameter<double>("ground_clearance", follow_cfg_.ground_clearance);
+    follow_cfg_.band_separation =
+      declare_parameter<double>("band_separation", follow_cfg_.band_separation);
+    follow_cfg_.governor.emergency_floor =
+      declare_parameter<double>("governor_emergency_floor",
+                                follow_cfg_.governor.emergency_floor);
+    follow_cfg_.auto_low_band =
+      declare_parameter<bool>("auto_low_band", follow_cfg_.auto_low_band);
+
+    // --- gap-based local steering (VFH+) ---
+    follow_cfg_.vfh.enable =
+      declare_parameter<bool>("vfh_enable", follow_cfg_.vfh.enable);
+    follow_cfg_.vfh.bins =
+      declare_parameter<int>("vfh_bins", follow_cfg_.vfh.bins);
+    follow_cfg_.vfh.d_safe =
+      declare_parameter<double>("vfh_d_safe", follow_cfg_.vfh.d_safe);
+    follow_cfg_.vfh.auto_d_safe =
+      declare_parameter<bool>("vfh_auto_d_safe", follow_cfg_.vfh.auto_d_safe);
+    follow_cfg_.vfh.d_safe_margin =
+      declare_parameter<double>("vfh_d_safe_margin", follow_cfg_.vfh.d_safe_margin);
+    follow_cfg_.vfh.goal_weight =
+      declare_parameter<double>("vfh_goal_weight", follow_cfg_.vfh.goal_weight);
+    follow_cfg_.vfh.hysteresis_deg =
+      declare_parameter<double>("vfh_hysteresis_deg", follow_cfg_.vfh.hysteresis_deg);
+    follow_cfg_.vfh.max_turn_deg =
+      declare_parameter<double>("vfh_max_turn_deg", follow_cfg_.vfh.max_turn_deg);
+
+    // --- P2 recovery / target search ---
+    recovery_cfg_.enable = declare_parameter<bool>("recovery_enable", recovery_cfg_.enable);
+    recovery_cfg_.stuck_window =
+      declare_parameter<double>("recovery_stuck_window", recovery_cfg_.stuck_window);
+    recovery_cfg_.stuck_dist =
+      declare_parameter<double>("recovery_stuck_dist", recovery_cfg_.stuck_dist);
+    recovery_cfg_.backup_dist =
+      declare_parameter<double>("recovery_backup_dist", recovery_cfg_.backup_dist);
+    recovery_cfg_.backup_speed =
+      declare_parameter<double>("recovery_backup_speed", recovery_cfg_.backup_speed);
+    recovery_cfg_.spin_rate =
+      declare_parameter<double>("recovery_spin_rate", recovery_cfg_.spin_rate);
+    recovery_cfg_.spin_timeout =
+      declare_parameter<double>("recovery_spin_timeout", recovery_cfg_.spin_timeout);
+    recovery_cfg_.max_attempts =
+      declare_parameter<int>("recovery_max_attempts", recovery_cfg_.max_attempts);
+
+    search_cfg_.enable = declare_parameter<bool>("search_enable", search_cfg_.enable);
+    search_cfg_.coast_time =
+      declare_parameter<double>("search_coast_time", search_cfg_.coast_time);
+    search_cfg_.spin_timeout =
+      declare_parameter<double>("search_spin_timeout", search_cfg_.spin_timeout);
+    search_cfg_.go_speed =
+      declare_parameter<double>("search_go_speed", search_cfg_.go_speed);
+    search_cfg_.go_tol = declare_parameter<double>("search_go_tol", search_cfg_.go_tol);
+    search_cfg_.go_timeout =
+      declare_parameter<double>("search_go_timeout", search_cfg_.go_timeout);
+    search_cfg_.search_budget =
+      declare_parameter<double>("search_budget", search_cfg_.search_budget);
+    search_cfg_.max_sweeps =
+      declare_parameter<int>("search_max_sweeps", search_cfg_.max_sweeps);
+
+    // --- TTC speed governor ---
+    follow_cfg_.governor.enable =
+      declare_parameter<bool>("governor_enable", follow_cfg_.governor.enable);
+    follow_cfg_.governor.d_hard =
+      declare_parameter<double>("governor_d_hard", follow_cfg_.governor.d_hard);
+    follow_cfg_.governor.d_margin =
+      declare_parameter<double>("governor_d_margin", follow_cfg_.governor.d_margin);
+    follow_cfg_.governor.t_lat =
+      declare_parameter<double>("governor_t_lat", follow_cfg_.governor.t_lat);
+    follow_cfg_.governor.a_max =
+      declare_parameter<double>("governor_a_max", follow_cfg_.governor.a_max);
+    follow_cfg_.governor.v_cap =
+      declare_parameter<double>("governor_v_cap", follow_cfg_.governor.v_cap);
+    follow_cfg_.governor.release_hysteresis =
+      declare_parameter<double>("governor_release_hysteresis",
+                                follow_cfg_.governor.release_hysteresis);
 
     smoother_cfg_.max_linear_accel =
       declare_parameter<double>("max_linear_accel", smoother_cfg_.max_linear_accel);
@@ -231,11 +377,17 @@ private:
 
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 2000,
-      "target=%s range=%.2f bearing=%.1fdeg pts=%d min_obs=%.2f cmd=(%.2f,%.2f,%.2f)",
+      "target=%s range=%.2f bearing=%.1fdeg pts=%d min_obs=%.2f "
+      "clr(f/r/u)=%.2f/%.2f/%.2f vlim=%.2f excl=%s cmd=(%.2f,%.2f,%.2f)",
       last_result_.target_valid ? "LOCK" : "NONE",
       last_result_.target_range, last_result_.target_bearing * 180.0 / M_PI,
       last_result_.points_in_target,
       std::isfinite(last_result_.min_obstacle_dist) ? last_result_.min_obstacle_dist : -1.0,
+      std::isfinite(last_result_.clearance_front) ? last_result_.clearance_front : -1.0,
+      std::isfinite(last_result_.clearance_rear) ? last_result_.clearance_rear : -1.0,
+      std::isfinite(last_result_.clearance_used) ? last_result_.clearance_used : -1.0,
+      std::isfinite(last_result_.speed_limit) ? last_result_.speed_limit : -1.0,
+      last_result_.target_excluded ? "Y" : "n",
       last_result_.cmd.linear.x, last_result_.cmd.linear.y, last_result_.cmd.angular.z);
   }
 
@@ -259,6 +411,10 @@ private:
     const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
                                   1.0 - 2.0 * (q.y * q.y + q.z * q.z));
     controller_.setOdomPose(p.x, p.y, yaw);
+    pose_x_ = p.x;
+    pose_y_ = p.y;
+    pose_yaw_ = yaw;
+    have_pose_ = true;
 
     if (compensate_slip_) {
       const auto & tw = msg->twist.twist;
@@ -284,6 +440,7 @@ private:
     const auto now_tp = std::chrono::steady_clock::now();
     const double dt = std::chrono::duration<double>(now_tp - last_tick_time_).count();
     last_tick_time_ = now_tp;
+    fsm_time_ += dt;
 
     const double age = (now() - last_cloud_time_).seconds();
     const bool fresh = age < cmd_timeout_;
@@ -297,11 +454,63 @@ private:
         desired.angular.z = direct_wz_;
       } else if (last_result_.target_valid) {   // FOLLOW
         if (last_result_.emergency_stop) {
+          // Hard stop: no translation may continue. The controller still emits
+          // a bounded in-place rotation so the robot can turn out of the corner
+          // it was stopped by; passing it through the smoother would defeat the
+          // instant stop, so it is applied directly below.
           emergency = true;
+          // The controller emits a bounded escape command (in-place rotation,
+          // plus reverse/strafe that provably increase clearance). It must
+          // reach the base unfiltered, so it bypasses the smoother.
+          emergency_cmd_ = last_result_.cmd;
         } else {
           desired = last_result_.cmd;
         }
+        // The tracker has the person: remember where, so a later loss can be
+        // searched for instead of ending in a permanent stall.
+        search_.noteSighting(fsm_time_, pose_x_, pose_y_);
+      } else {                                  // no target: search for them
+        search_.noteLost(fsm_time_);
       }
+
+      // ---- P2: target search (only while the tracker has nothing) ----
+      if (control_mode_ != 0 && !last_result_.target_valid) {
+        double svx = 0.0, swz = 0.0;
+        bool arrived = false;
+        if (search_.update(fsm_time_, pose_x_, pose_y_, &svx, &swz, &arrived)) {
+          desired.linear.x = svx;
+          desired.angular.z = swz;
+        } else {
+          desired = geometry_msgs::msg::Twist();   // HOLD / COAST: stand still
+        }
+      }
+
+      // ---- P2: stuck recovery ----
+      //
+      // This runs EVEN WHILE THE HARD STOP IS ACTIVE. Gating it on
+      // `!emergency` was self-defeating: a wide obstacle (a 1 m step against a
+      // 0.36 m body) leaves no traversable heading at the current pose, so the
+      // controller can only rotate, the robot never translates, and the very
+      // state that needs recovery was the one state recovery was not allowed to
+      // act in. The machine's own outputs are bounded and it is the only path
+      // that reverses out to where a gap becomes reachable again.
+      double rvx = 0.0, rvy = 0.0, rwz = 0.0;
+      const bool rcmd = (control_mode_ != 0 && last_result_.target_valid &&
+        recovery_.update(fsm_time_, pose_x_, pose_y_, pose_yaw_,
+                         desired.linear.x, desired.linear.y, desired.angular.z,
+                         last_result_.clearance_rear, &rvx, &rvy, &rwz));
+      if (rcmd) {
+        desired.linear.x = rvx;
+        desired.linear.y = rvy;
+        desired.angular.z = rwz;
+        emergency = false;          // recovery motion must reach the base
+        recovery_active_ = true;
+      } else {
+        recovery_active_ = false;
+      }
+    } else if (active_ && !fresh) {
+      // lost the sensor: nothing to search with, stand still
+      desired = geometry_msgs::msg::Twist();
     }
 
     // slip / speed compensation (follow only)
@@ -314,7 +523,10 @@ private:
       desired.angular.z = std::clamp(desired.angular.z, -max_angular_cmd_, max_angular_cmd_);
     }
 
-    const geometry_msgs::msg::Twist out = smoother_.step(desired, dt, emergency);
+    geometry_msgs::msg::Twist out = smoother_.step(desired, dt, emergency);
+    if (emergency) {
+      out = emergency_cmd_;
+    }
     // feed the actually-commanded motion back so the target filter can work in
     // an inertial frame (compensates the robot's own rotation)
     controller_.setOdomTwist(out.linear.x, out.linear.y, out.angular.z);
@@ -323,6 +535,35 @@ private:
     last_pub_vx_ = out.linear.x;
     last_pub_vy_ = out.linear.y;
     last_pub_wz_ = out.angular.z;
+
+    // ---- diagnostics: which FSM is acting, and how far the robot got ----
+    // Machine-readable state, sampled by the acceptance harness. The numbers
+    // are included because a frozen robot is otherwise indistinguishable from
+    // one whose controller legitimately commanded zero: min_obs tells you what
+    // the safety layer actually saw, and vlim why it slowed.
+    char buf[320];
+    const auto f2 = [](double v) {
+        return std::isfinite(v) ? v : -1.0;
+      };
+    std::snprintf(
+      buf, sizeof(buf),
+      "recovery=%s attempts=%d search=%s min_obs=%.3f d_stop=%.3f d_slow=%.3f "
+      "vlim=%.3f clr_f=%.3f clr_r=%.3f vfh=%.2f vfh_free=%.3f vfh_trav=%d "
+      "vfh_block=%d esc=%d excl=%d",
+      toString(recovery_.state()), recovery_.attempts(),
+      toString(search_.state()),
+      f2(last_result_.min_obstacle_dist),
+      f2(last_result_.clearance_used),
+      f2(last_result_.clearance_slow),
+      f2(last_result_.speed_limit),
+      f2(last_result_.clearance_front),
+      f2(last_result_.clearance_rear),
+      last_result_.vfh_dir, f2(last_result_.vfh_free),
+      last_result_.vfh_traversable ? 1 : 0, last_result_.vfh_blocked ? 1 : 0,
+      recovery_active_ ? 1 : 0, last_result_.target_excluded ? 1 : 0);
+    std_msgs::msg::String st;
+    st.data = buf;
+    state_pub_->publish(st);
   }
 
   void publishScan(const ScanFrame & scan)
@@ -395,6 +636,15 @@ private:
   FollowConfig follow_cfg_;
   SmootherConfig smoother_cfg_;
   FollowController controller_;
+  RecoveryMachine recovery_;
+  TargetSearchMachine search_;
+  RecoveryConfig recovery_cfg_;
+  SearchConfig search_cfg_;
+  double fsm_time_ = 0.0;
+  bool recovery_active_ = false;
+  geometry_msgs::msg::Twist emergency_cmd_;
+  double pose_x_ = 0.0, pose_y_ = 0.0, pose_yaw_ = 0.0;
+  bool have_pose_ = false;
   CmdSmoother smoother_;
   FollowResult last_result_;
   ScanFrame last_scan_;
@@ -436,6 +686,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr target_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr target_raw_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_pub_;
   rclcpp::TimerBase::SharedPtr control_timer_;
 };

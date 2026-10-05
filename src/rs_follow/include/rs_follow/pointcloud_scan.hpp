@@ -1,11 +1,19 @@
 /**
  * @file pointcloud_scan.hpp
- * @brief Project a 3D RoboSense point cloud into a 2D polar scan.
+ * @brief Project a 3D point cloud into 2D polar scans.
  *
- * The 3D cloud is sliced by a height band (z), then for each azimuth bin the
- * minimum horizontal range is kept. This produces a virtual LaserScan-like
- * representation that is independent of the LiDAR model / beam count, so the
- * follow logic below works with any RoboSense (or any XYZ) point cloud.
+ * The 3D cloud is sliced by one or more height bands (z), then for each
+ * azimuth bin the minimum horizontal range is kept. This produces a virtual
+ * LaserScan-like representation that is independent of the LiDAR model / beam
+ * count, so the follow logic below works with any (or any XYZ) point cloud.
+ *
+ * TWO BANDS are supported:
+ *   - the TARGET band (height_min/height_max): person torso, used for target
+ *     acquisition and tracking. It is what the original code used.
+ *   - the LOW band (low_height_min/low_height_max): near the floor, used for
+ *     OBSTACLES ONLY. A quadruped's typical failure is a step, curb or small
+ *     object below the target band, which the single-band version could not
+ *     see at all. Low-band returns are never eligible as a follow target.
  */
 
 #ifndef RS_FOLLOW_POINTCLOUD_SCAN_HPP
@@ -25,8 +33,14 @@ namespace rs_follow
 
 struct ProjectionConfig
 {
+  // --- target band (person torso) ---
   double height_min = -0.4;    // z band lower bound (m), in cloud frame
   double height_max = 1.8;     // z band upper bound (m)
+  // --- low band (near-floor obstacles) ---
+  bool enable_low_band = false;
+  double low_height_min = -0.9;
+  double low_height_max = -0.45;
+
   double z_offset = 0.0;       // shift applied before band check (m)
   int angle_bins = 1440;       // azimuth bins (1440 -> 0.25 deg)
   double range_min = 0.25;     // ignore returns closer than this (m)
@@ -39,13 +53,28 @@ struct ScanFrame
 {
   rclcpp::Time stamp;
   std::string frame_id;
-  std::vector<float> ranges;   // per bin, +inf when empty
+  std::vector<float> ranges;   // per bin, +inf when empty (TARGET band)
+  std::vector<float> low_ranges;  // per bin, +inf when empty (LOW band)
   double angle_min = -M_PI;
   double angle_increment = 0.0;
   int valid_bins = 0;
+  int valid_low_bins = 0;
 
-  float rangeAt(int i) const { return ranges[static_cast<size_t>(i)]; }
-  double angleAt(int i) const { return angle_min + angle_increment * i; }
+  float rangeAt(int i) const {return ranges[static_cast<size_t>(i)];}
+  float lowRangeAt(int i) const
+  {
+    return low_ranges.empty() ? std::numeric_limits<float>::infinity()
+                              : low_ranges[static_cast<size_t>(i)];
+  }
+  double angleAt(int i) const {return angle_min + angle_increment * i;}
+
+  /** Combined obstacle range: the nearer of the two bands (either may be inf). */
+  float obstacleAt(int i) const
+  {
+    const float a = ranges[static_cast<size_t>(i)];
+    const float b = lowRangeAt(i);
+    return (b < a) ? b : a;
+  }
 };
 
 inline bool hasFloatField(const sensor_msgs::msg::PointCloud2 & msg, const std::string & name)
@@ -79,7 +108,9 @@ inline bool projectPointCloud(
   out.angle_increment = (2.0 * M_PI) / static_cast<double>(cfg.angle_bins);
   const float inf = std::numeric_limits<float>::infinity();
   out.ranges.assign(static_cast<size_t>(cfg.angle_bins), inf);
+  out.low_ranges.assign(static_cast<size_t>(cfg.angle_bins), inf);
   out.valid_bins = 0;
+  out.valid_low_bins = 0;
 
   const float rmin2 = static_cast<float>(cfg.range_min * cfg.range_min);
   const float rmax2 = static_cast<float>(cfg.range_max * cfg.range_max);
@@ -100,7 +131,10 @@ inline bool projectPointCloud(
       if (cfg.flip_y) {py = -py;}
 
       const float zz = pz - static_cast<float>(cfg.z_offset);
-      if (zz < cfg.height_min || zz > cfg.height_max) {
+      const bool in_target_band = (zz >= cfg.height_min && zz <= cfg.height_max);
+      const bool in_low_band = cfg.enable_low_band &&
+        (zz >= cfg.low_height_min && zz <= cfg.low_height_max);
+      if (!in_target_band && !in_low_band) {
         continue;
       }
 
@@ -113,13 +147,20 @@ inline bool projectPointCloud(
       int bin = static_cast<int>((az - out.angle_min) / out.angle_increment);
       if (bin < 0) {bin = 0;}
       if (bin >= cfg.angle_bins) {bin = cfg.angle_bins - 1;}
-
+      const size_t bi = static_cast<size_t>(bin);
       const float r = std::sqrt(r2);
-      if (r < out.ranges[static_cast<size_t>(bin)]) {
-        if (!std::isfinite(out.ranges[static_cast<size_t>(bin)])) {
+
+      if (in_target_band && r < out.ranges[bi]) {
+        if (!std::isfinite(out.ranges[bi])) {
           ++out.valid_bins;
         }
-        out.ranges[static_cast<size_t>(bin)] = r;
+        out.ranges[bi] = r;
+      }
+      if (in_low_band && r < out.low_ranges[bi]) {
+        if (!std::isfinite(out.low_ranges[bi])) {
+          ++out.valid_low_bins;
+        }
+        out.low_ranges[bi] = r;
       }
     }
   } catch (const std::runtime_error &) {
