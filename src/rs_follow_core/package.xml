@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>rs_follow_core</name>
+  <version>1.0.0</version>
+  <description>
+    Framework-independent RoboSense 3D LiDAR person-following algorithm.
+
+    Contains no ROS dependency at all: it builds with a bare g++ -std=c++17 and
+    can be linked into a non-ROS upper-computer program, bound to Python, or
+    wrapped by the rs_follow ROS 2 node (which is now a thin adapter).
+  </description>
+  <maintainer email="bernardleex526@users.noreply.github.com">bernard</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>cmake</buildtool_depend>
+
+  <export>
+    <build_type>cmake</build_type>
+  </export>
+</package>

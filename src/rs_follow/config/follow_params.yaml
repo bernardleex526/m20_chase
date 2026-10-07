@@ -16,9 +16,19 @@ rs_follow_node:
     cmd_timeout: 0.5             # publish zero after this long without a scan
     publish_scan_debug: true
 
-    # --- 3D cloud -> 2D polar scan projection ---
+    # --- 3D cloud -> 2D polar scan projection (TARGET band: person torso) ---
     height_min: -0.40            # keep returns in this z band (m, lidar frame)
     height_max: 1.80             # person torso ~ up to 1.8 m above the lidar
+    # --- LOW band (near-floor obstacles: steps, curbs, small objects) ---
+    # A quadruped's classic blind spot. Obstacles only -- never a follow target.
+    enable_low_band: false       # set true when the lidar FOV reaches the floor
+    # With auto_low_band the two values below are DERIVED and the literals here
+    # are only a fallback. The band must never reach the floor: ground sits at
+    # sensor z = -sensor_height, and a band containing it fills all 360 bins
+    # with the floor and masks the person completely.
+    auto_low_band: true
+    low_height_min: -0.65
+    low_height_max: -0.45
     z_offset: 0.0
     angle_bins: 1440             # 0.25 deg azimuth resolution
     range_min: 0.25
@@ -56,13 +66,95 @@ rs_follow_node:
     max_angular_jerk: 20.0      # rad/s^3
     cmd_filter_alpha: 0.60      # 0 = off; (0,1] first-order low-pass on cmd
 
-    # --- obstacle avoidance (artificial potential field) ---
+    # --- obstacle avoidance (artificial potential field: lateral nudging only) ---
     apf_influence: 0.60
     apf_gain: 0.02
-    apf_emergency: 0.35
-    apf_slowdown: 0.70
+    apf_emergency: 0.35         # legacy fixed radius; superseded by the governor
+    apf_slowdown: 0.70          # legacy; superseded by the governor
+
+    # --- obstacle handling / safety (P0) ---
+    exclude_target_from_obstacles: true   # the followed person is not an obstacle
+    target_exclude_slack: 0.25            # radial slack on the exclusion window (m)
+    direction_gated_obstacles: true       # only the sector being entered may limit
+    # Cone that may limit motion along the travel direction. MUST stay < 90 deg:
+    # an obstacle at +-90 deg is beside the robot, has no closing component
+    # along a forward drive, and must only nudge laterally (corridor following).
+    sector_half_angle_deg: 60.0
+    # Robot outline (m). SINGLE SOURCE OF TRUTH for the body size: the governor's
+    # clearance maths and the self-occlusion frame_* below must agree with it.
+    robot_length: 0.62
+    robot_width: 0.36
+    # Derive the self-occlusion box from the outline above. Leave TRUE unless
+    # you have a measured reason not to: a hand-set frame narrower than the body
+    # makes the robot see its own chassis as an obstacle.
+    auto_frame: true
+    self_occlusion_margin: 0.08
+    # Lidar height above the floor and the clearance kept above it. Used to
+    # derive the low band; measure it on the real robot.
+    sensor_height: 0.75
+    ground_clearance: 0.10
+
+    # --- TTC speed governor (replaces the fixed-radius e-stop) ---
+    governor_enable: true
+    governor_d_hard: 0.25       # hard stop below this clearance (m)
+    governor_d_margin: 0.15     # clearance kept from the robot outline (m)
+    governor_t_lat: 0.20        # DESIGN ASSUMPTION: measure on the real robot (s)
+    governor_a_max: 0.80        # planning deceleration (m/s^2), <= max_linear_accel
+    governor_v_cap: 1.50        # limit is non-binding above this (m/s)
+    # Clearance that must be regained before a hard stop releases. Without this
+    # the clearance chatters across d_hard and the escape direction flips.
+    governor_release_hysteresis: 0.15
+    # Standoff the TTC curve brakes to (on top of the obstacle's clearance).
+    governor_d_margin_slow: 0.05
+    # Omnidirectional hard-stop floor: if the body is within this of ANYTHING,
+    # in any direction, stop. Kept small so a wall 0.30 m to the side (0.12 m of
+    # true clearance) does not freeze a forward drive.
+    governor_emergency_floor: 0.08
+    # Corridor widening for the speed limit (must stay below the distance to a
+    # typical parallel wall, or corridors brake the robot everywhere).
+    governor_lateral_margin: 0.25
+    governor_stop_margin: 0.05
+
+    # --- gap-based local steering (VFH+): the actual "go around it" logic ---
+    # Steers into the cheapest traversable gap in the scan instead of always
+    # aiming at the target bearing. This is what turns "stop" into "detour".
+    vfh_enable: true
+    vfh_bins: 360               # planning resolution (1 deg)
+    vfh_d_safe: 0.30            # clearance that makes a heading traversable (m)
+    vfh_goal_weight: 1.0        # cost per radian of deviation from the target
+    vfh_hysteresis_deg: 10.0    # bonus for keeping the previous heading
+    # 180 = consider every heading. Must stay 180 for a follower: the cost
+    # function already prefers the person's direction, and clamping it makes a
+    # person standing behind the robot unreachable (the robot pirouettes).
+    vfh_max_turn_deg: 180.0
+    # Derive d_safe from the governor's hard-stop floor + margin. It MUST exceed
+    # the stop band, or the planner aims into the very band that stops the robot.
+    vfh_auto_d_safe: true
+    vfh_d_safe_margin: 0.10
+
+    # --- P2 recovery: turn "stuck" into "recovers" ---
+    recovery_enable: true
+    recovery_stuck_window: 2.0  # s of no progress before acting
+    recovery_stuck_dist: 0.05   # m of travel below which it counts as stuck
+    recovery_backup_dist: 0.40  # m to reverse
+    recovery_backup_speed: 0.25 # m/s
+    recovery_spin_rate: 0.60    # rad/s while looking for a way out
+    recovery_spin_timeout: 6.0  # s per spin attempt
+    recovery_max_attempts: 3    # then HOLD and report, never retry forever
+
+    # --- P2 target search: re-acquire after the tracker gives up ---
+    search_enable: true
+    search_coast_time: 1.0      # s of coast before scanning
+    search_spin_timeout: 12.0   # s spent scanning for the person
+    search_go_speed: 0.35       # m/s toward the last known position
+    search_go_tol: 0.5          # m considered "arrived"
+    search_go_timeout: 12.0     # s per go-to attempt
+    search_budget: 60.0         # total s of searching before HOLD
+    search_max_sweeps: 6        # scanning sweeps before HOLD
 
     # --- robot self-occlusion box (lidar frame) ---
+    # MUST be calibrated to the real outline; the original +-0.25 m side values
+    # are narrower than most quadrupeds.
     frame_front: 0.25
     frame_back: 0.45
     frame_left: 0.25
@@ -84,3 +176,58 @@ rs_follow_node:
 
     # --- manual binding ---
     bind_radius: 0.60
+
+    # =====================================================================
+    # P1: MULTI-TARGET TRACKING (identity over time)
+    # =====================================================================
+    # The single-target tracker can only ever see "the one I locked", so in a
+    # crowd a passer-by is indistinguishable from the target being occluded, and
+    # a loss ends in a blind re-acquisition on whoever is nearest. With this on,
+    # every person-like cluster gets a stable id, a briefly occluded person is
+    # PREDICTED rather than dropped, and the lock follows the id.
+    #
+    # This is geometric identity, NOT appearance Re-ID: two people who cross and
+    # swap places can still be confused. Real Re-ID needs a camera and a learned
+    # descriptor, which this package deliberately does not depend on.
+    multi_target_enable: false   # opt-in: it changes target selection behaviour
+    multi_target_max_range: 8.0  # ignore clusters beyond this (m)
+    # Gate (m) for matching a measurement to a track's predicted position. Too
+    # small and a walking person is dropped and re-created every frame (id
+    # churn); too large and two nearby people merge into one track.
+    multi_target_assoc_gate: 0.70
+    multi_target_max_missed: 15  # frames of prediction before a track dies
+    multi_target_max_tracks: 8   # hard cap on simultaneous tracks
+    multi_target_person_width: 0.50  # width of a real person (m), for ranking
+    # Widest cluster accepted as a person (m). A person is ~0.5 m across; a wall
+    # reads far wider at the same range. Range-independent by design.
+    multi_target_max_width: 0.90
+    # 0 = nearest, 1 = most person-like, 2 = keep the locked id (default),
+    # 3 = largest/most visible.
+    multi_target_select: 2
+
+    # =====================================================================
+    # P1: DYNAMIC OBSTACLE PREDICTION
+    # =====================================================================
+    # The stock safety layer reasons about the CURRENT scan and per-bin range
+    # rate. Both fail on the case that matters most for a follower -- a person
+    # walking ACROSS the path: their range barely changes (so a range-rate test
+    # reads ~0) while their bearing sweeps (so the bin they occupy changes every
+    # frame and the range difference is noise). This tracks obstacles by centroid
+    # instead, removes the robot's own motion, and predicts where they will be
+    # when the robot arrives.
+    dynamic_obstacle_enable: true
+    dynamic_obstacle_lookahead: 1.5   # s of extrapolation for "will it be there"
+    dynamic_obstacle_corridor_margin: 0.25  # extra half-width when testing the path (m)
+    dynamic_obstacle_assoc_gate: 0.60 # m, against the predicted position
+    dynamic_obstacle_max_range: 6.0   # obstacles beyond this do not constrain (m)
+    dynamic_obstacle_vel_alpha: 0.40  # low-pass on the estimated velocity
+
+    # =====================================================================
+    # PERFORMANCE INSTRUMENTATION
+    # =====================================================================
+    # Per-stage timing (projection / controller / smoothing / publish / total)
+    # and resident memory. Off by default: the scope guards cost two clock reads
+    # per call, which is negligible against a 1440-bin projection but not free.
+    # The report is printed by the control loop every perf_report_every ticks.
+    perf_enable: false
+    perf_report_every: 500       # ~10 s at 50 Hz; 0 disables periodic output

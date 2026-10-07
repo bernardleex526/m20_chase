@@ -7,16 +7,56 @@
 [jie_deamon](https://github.com/6-robot/jie_deamon)（MIT），并从 2D `LaserScan` 扩展为直接适配
 RoboSense `PointCloud2`。
 
+## 包结构（算法与 ROS 已解耦）
+
+本包**不再包含算法实现**，它只是 ROS 2 适配层。算法在独立的 **`rs_follow_core`** 包里：
+
+```
+src/rs_follow_core/           ← 纯 C++ 算法库，零 ROS 依赖
+  include/rs_follow_core/
+    types.hpp                 与框架无关的数据类型 (PointCloud/Odometry/Twist)
+    pointcloud_scan.hpp       3D→2D 投影（双高度带）
+    follow_controller.hpp     目标跟踪 + 控制律 + 安全层
+    vfh_planner.hpp           VFH+ 局部绕行
+    speed_governor.hpp        TTC 调速
+    kalman_filter_2d.hpp      目标卡尔曼滤波
+    cmd_smoother.hpp          加速度/加加速度限幅
+    recovery_fsm.hpp          卡死恢复 / 目标搜索状态机
+    multi_target_tracker.hpp  多目标 ID 跟踪（身份保持）
+    dynamic_obstacle.hpp      动态障碍预测（横穿行人）
+    perf_monitor.hpp          分级耗时/内存统计
+    lidar_follower.hpp        门面类：点云进、Twist 出
+
+src/rs_follow/                ← ROS 2 适配层（薄）
+  include/rs_follow/ros_adapter.hpp   ROS 消息 ↔ core 类型 的唯一转换点
+  src/rs_follow_node.cpp              订阅/发布/定时器
+```
+
+这样做的原因：算法原先与 `rclcpp` / `geometry_msgs` 深度耦合，导致**无法脱离 ROS 做单元测试、
+无法被非 ROS 上位机链接、无法给 Python 绑定**。现在 `rs_follow_core` 可以用裸编译器直接构建：
+
+```bash
+cd src/rs_follow_core
+cmake -S . -B build -DRS_FOLLOW_CORE_BUILD_TESTS=ON
+cmake --build build && ./build/test_core     # 无需 ROS
+```
+
+**时间由调用方提供**：`FollowController::update(scan, dt)` 不再内部读墙上时钟。这既让单元测试
+可复现，也保证在仿真时间（Gazebo / rosbag 回放 / `use_sim_time`）下 dt 正确。
+
 ## 数据流
 
 ```
 /rslidar_points (PointCloud2)
+        │  ros_adapter.hpp: PointCloud2 → core::PointCloud
         │  projectPointCloud(): 高度带切片 + 方位分bin取最近 → 虚拟2D扫描(1440 bins)
         ▼
-FollowController
-   ├─ 目标获取: 自动选正前方最近点 或 手动绑定(/clicked_point)
+rs_follow_core::LidarFollower
+   ├─ 多目标跟踪: 人形簇聚类 + ID 关联（可选，身份保持）
+   ├─ 动态障碍: 质心速度估计 + 预测（横穿行人）
+   ├─ 目标获取: 自动选正前方人形簇 或 手动绑定(/clicked_point)
    ├─ 目标跟踪: 目标半径内点簇质心 + 卡尔曼平滑
-   ├─ 避障: 势场法排斥力 + 急停 + 减速
+   ├─ 避障: TTC 调速 + VFH+ 绕行 + 自遮挡排除
    └─ 控制律: 距离误差→linear.x  方位误差→angular.z  走廊→linear.y
         ▼
 /cmd_vel (Twist)

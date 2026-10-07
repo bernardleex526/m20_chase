@@ -2,12 +2,18 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>rs_follow</name>
-  <version>0.1.0</version>
-  <description>Generic RoboSense 3D LiDAR point-cloud person/target following for ROS 2 (publishes cmd_vel).</description>
+  <version>0.2.0</version>
+  <description>Generic RoboSense 3D LiDAR point-cloud person/target following for ROS 2 (publishes cmd_vel). Thin ROS 2 adapter over the ROS-free rs_follow_core algorithm library.</description>
   <maintainer email="jetson@example.com">jetson</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- The algorithm itself, as a ROS-free CMake package. Everything this node
+       used to contain (control law, safety layer, planner, state machines) now
+       lives there, so it can also be driven from a non-ROS upper computer, from
+       a middleware-free unit test, or from Python via pybind11. -->
+  <depend>rs_follow_core</depend>
 
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>

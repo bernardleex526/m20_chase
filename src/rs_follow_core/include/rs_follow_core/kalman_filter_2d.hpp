@@ -43,16 +43,19 @@ public:
     P_[15] = 10.0;
   }
 
+  /**
+   * @brief Predict+correct one measurement.
+   * @param dt seconds since the previous update; supplied by the caller so
+   *           the filter is deterministic and correct under simulated time.
+   */
   void update(double meas_x, double meas_y, double & fx, double & fy,
-              bool * accepted = nullptr, int n_points = 0)
+              double dt, bool * accepted = nullptr, int n_points = 0)
   {
-    auto now = std::chrono::steady_clock::now();
     if (!initialized_) {
       x_[0] = meas_x;
       x_[1] = meas_y;
       x_[2] = 0.0;
       x_[3] = 0.0;
-      last_time_ = now;
       initialized_ = true;
       fx = meas_x;
       fy = meas_y;
@@ -60,8 +63,6 @@ public:
       return;
     }
 
-    double dt = std::chrono::duration<double>(now - last_time_).count();
-    last_time_ = now;
     if (dt <= 0.0 || dt > 1.0) {
       dt = 0.1;
     }
@@ -97,7 +98,6 @@ public:
     P_[10] = 10.0;
     P_[15] = 10.0;
     initialized_ = true;
-    last_time_ = std::chrono::steady_clock::now();
   }
 
   bool isInitialized() const { return initialized_; }
@@ -229,7 +229,6 @@ private:
   bool initialized_ = false;
   std::array<double, 4> x_;
   std::array<double, 16> P_;
-  std::chrono::steady_clock::time_point last_time_;
 };
 
 }  // namespace rs_follow

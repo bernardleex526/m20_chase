@@ -1,0 +1,9 @@
+@PACKAGE_INIT@
+
+# rs_follow_core is header-only, so this config file only has to expose the
+# include directory and the imported INTERFACE target.
+include("${CMAKE_CURRENT_LIST_DIR}/rs_follow_coreTargets.cmake")
+
+set_and_check(rs_follow_core_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
+
+check_required_components(rs_follow_core)
