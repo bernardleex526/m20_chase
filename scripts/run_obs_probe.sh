@@ -13,8 +13,9 @@ sleep 2
 # Drive the robot forward 0.9 m (the distance at which S8 froze) then probe.
 ros2 run rs_follow rs_follow_node --ros-args \
   -p input_topic:=/rslidar_points -p active:=false -p odom_topic:=/odom \
+  -p control_frame:=rslidar \
   -p height_min:=-0.40 -p height_max:=1.50 \
-  -p enable_low_band:=true -p low_height_min:=-0.75 -p low_height_max:=-0.45 \
+  -p enable_low_band:=true -p low_height_min:=-0.65 -p low_height_max:=-0.42 \
   -p cmd_vel_topic:=/cmd_vel -p auto_select_front:=false \
   > /tmp/probe_node.log 2>&1 &
 NPID=$!
@@ -30,6 +31,7 @@ ep = n.create_publisher(Bool, "/rs_follow/enable", 10)
 time.sleep(1)
 p = PointStamped(); p.header.frame_id = "rslidar"; p.point.x = 4.5
 for _ in range(5):
+    p.header.stamp = n.get_clock().now().to_msg()
     bp.publish(p); time.sleep(0.1)
 ep.publish(Bool(data=True))
 time.sleep(9)          # let it drive forward

@@ -15,6 +15,16 @@
 #include <cmath>
 #include <memory>
 #include <string>
+#include <stdexcept>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/exceptions.h>
 
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
@@ -30,7 +40,9 @@
 #include "rs_follow/cmd_smoother.hpp"
 #include "rs_follow/follow_controller.hpp"
 #include "rs_follow/pointcloud_scan.hpp"
+#include "rs_follow/binding.hpp"
 #include "rs_follow/recovery_fsm.hpp"
+#include "rs_follow_interfaces/srv/bind_target.hpp"
 
 namespace rs_follow
 {
@@ -42,7 +54,16 @@ public:
   : rclcpp::Node("rs_follow_node")
   {
     loadParams();
-    deriveLowBand();
+    if (!std::isfinite(cmd_timeout_) || cmd_timeout_ <= 0.0 ||
+      !std::isfinite(direct_cmd_timeout_) || direct_cmd_timeout_ <= 0.0 ||
+      !std::isfinite(target_observation_timeout_) || target_observation_timeout_ <= 0.0 ||
+      !std::isfinite(follow_cfg_.max_linear) || follow_cfg_.max_linear <= 0.0 ||
+      !std::isfinite(follow_cfg_.max_angular) || follow_cfg_.max_angular <= 0.0)
+    {throw std::invalid_argument("watchdog timeouts and velocity limits must be finite and positive");}
+    if (control_frame_.empty()) {throw std::invalid_argument("control_frame must not be empty");}
+    proj_cfg_.body = normalizeBodyFrame(follow_cfg_);
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
     controller_.setConfig(follow_cfg_);
     recovery_.setConfig(recovery_cfg_);
     search_.setConfig(search_cfg_);
@@ -73,6 +94,10 @@ public:
       [this](std_msgs::msg::Bool::SharedPtr msg) {
         if (msg->data) {
           controller_.clearTarget();
+          active_ = false;
+          have_target_observation_ = false;
+          last_result_ = FollowResult();
+          stopNow();
           RCLCPP_INFO(get_logger(), "target cleared");
         }
       });
@@ -80,7 +105,8 @@ public:
     enable_sub_ = create_subscription<std_msgs::msg::Bool>(
       "/rs_follow/enable", 10,
       [this](std_msgs::msg::Bool::SharedPtr msg) {
-        active_ = msg->data;
+        active_ = msg->data && !estop_;
+        if (!active_) {stopNow();}
         RCLCPP_INFO(get_logger(), "follow %s", active_ ? "ENABLED" : "DISABLED");
       });
 
@@ -88,6 +114,8 @@ public:
     mode_sub_ = create_subscription<std_msgs::msg::Int32>(
       "/rs_follow/control_mode", 10,
       [this](std_msgs::msg::Int32::SharedPtr msg) {
+        if (msg->data != 0 && msg->data != 1) {return;}
+        if (control_mode_ != msg->data) {stopNow();}
         control_mode_ = msg->data;
         RCLCPP_INFO(get_logger(), "control_mode -> %s",
                     control_mode_ == 0 ? "DIRECT" : "FOLLOW");
@@ -95,21 +123,50 @@ public:
     direct_sub_ = create_subscription<geometry_msgs::msg::Twist>(
       "/rs_follow/direct_cmd", 10,
       [this](geometry_msgs::msg::Twist::SharedPtr msg) {
-        direct_vx_ = msg->linear.x;
-        direct_vy_ = msg->linear.y;
-        direct_wz_ = msg->angular.z;
+        if (estop_ || !std::isfinite(msg->linear.x) ||
+          !std::isfinite(msg->linear.y) || !std::isfinite(msg->angular.z))
+        {
+          stopNow();
+          return;
+        }
+        direct_vx_ = std::clamp(msg->linear.x, -follow_cfg_.max_linear, follow_cfg_.max_linear);
+        direct_vy_ = follow_cfg_.enable_lateral ?
+          std::clamp(msg->linear.y, -follow_cfg_.max_linear, follow_cfg_.max_linear) : 0.0;
+        direct_wz_ = std::clamp(msg->angular.z, -follow_cfg_.max_angular, follow_cfg_.max_angular);
+        have_direct_ = true;
+        last_direct_time_ = std::chrono::steady_clock::now();
       });
 
     cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 10);
     scan_pub_ = create_publisher<sensor_msgs::msg::LaserScan>("/rs_follow/scan", 10);
+    cloud_viz_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/rs_follow/cloud_viz", 1);
     target_pub_ = create_publisher<geometry_msgs::msg::PointStamped>("/rs_follow/target", 10);
     target_raw_pub_ = create_publisher<geometry_msgs::msg::PointStamped>("/rs_follow/target_raw", 10);
     status_pub_ = create_publisher<std_msgs::msg::String>("/rs_follow/status", 10);
     marker_pub_ = create_publisher<visualization_msgs::msg::Marker>("/rs_follow/target_marker", 10);
     state_pub_ = create_publisher<std_msgs::msg::String>("/rs_follow/state", 10);
+    control_state_pub_ = create_publisher<std_msgs::msg::String>("/rs_follow/control_state", 10);
+    estop_sub_ = create_subscription<std_msgs::msg::Bool>(
+      "/rs_follow/estop", rclcpp::QoS(1).reliable().durability_volatile(),
+      [this](std_msgs::msg::Bool::SharedPtr msg) {
+        estop_ = msg->data;
+        active_ = false;
+        if (estop_) {
+          controller_.clearTarget();
+          have_target_observation_ = false;
+          last_result_ = FollowResult();
+        }
+        stopNow();
+      });
+    bind_service_ = create_service<rs_follow_interfaces::srv::BindTarget>(
+      "/rs_follow/bind", [this](
+        const std::shared_ptr<rs_follow_interfaces::srv::BindTarget::Request> request,
+        std::shared_ptr<rs_follow_interfaces::srv::BindTarget::Response> response) {
+        response->reason = validateBinding(request->point, response->target);
+        response->success = response->reason == "OK";
+      });
 
     last_result_ = FollowResult();
-    last_cloud_time_ = now();
 
     const double period = 1.0 / std::max(1.0, control_rate_hz_);
     control_timer_ = create_wall_timer(
@@ -124,42 +181,11 @@ public:
   }
 
 private:
-  /**
-   * @brief Derive the LOW obstacle band from the measured lidar height.
-   *
-   * The band must sit strictly ABOVE the floor: ground returns appear at sensor
-   * z = -sensor_height, and a band that includes them fills every azimuth bin
-   * with the floor. When that happens the person is masked out of the target
-   * band (only the nearest return per bin survives) and the lock is lost.
-   */
-  void deriveLowBand()
-  {
-    if (!proj_cfg_.enable_low_band || !follow_cfg_.auto_low_band) {
-      return;
-    }
-    proj_cfg_.low_height_min =
-      -follow_cfg_.sensor_height + follow_cfg_.ground_clearance;
-    // Leave a DEAD ZONE between the bands. With only 0.05 m of separation the
-    // top face of a low obstacle sits close enough to the target band that
-    // range noise carries it over the boundary, where it is clustered as if it
-    // were the person (observed as the tracker binding to a 0.30 m step and the
-    // follow loop then holding station on the obstacle). The dead zone means a
-    // low obstacle is detected by its SIDE faces, which span a range of z and
-    // therefore always cross the band.
-    proj_cfg_.low_height_max = proj_cfg_.height_min - follow_cfg_.band_separation;
-    if (proj_cfg_.low_height_max <= proj_cfg_.low_height_min) {
-      proj_cfg_.low_height_max = proj_cfg_.low_height_min + 0.05;
-    }
-    RCLCPP_INFO(
-      get_logger(),
-      "low band derived: [%.2f, %.2f] m (sensor_height=%.2f, ground_clearance=%.2f)",
-      proj_cfg_.low_height_min, proj_cfg_.low_height_max,
-      follow_cfg_.sensor_height, follow_cfg_.ground_clearance);
-  }
 
   void loadParams()
   {
     input_topic_ = declare_parameter<std::string>("input_topic", "/rslidar_points");
+    control_frame_ = declare_parameter<std::string>("control_frame", "base_link");
     cmd_vel_topic_ = declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
     odom_topic_ = declare_parameter<std::string>("odom_topic", odom_topic_);
     compensate_slip_ = declare_parameter<bool>("compensate_slip", compensate_slip_);
@@ -171,17 +197,16 @@ private:
     max_angular_cmd_ = declare_parameter<double>("max_angular_cmd", max_angular_cmd_);
     control_rate_hz_ = declare_parameter<double>("control_rate_hz", 50.0);
     cmd_timeout_ = declare_parameter<double>("cmd_timeout", 0.5);
+    direct_cmd_timeout_ = declare_parameter<double>("direct_cmd_timeout", 0.3);
+    target_observation_timeout_ = declare_parameter<double>("target_observation_timeout", 0.5);
     active_ = declare_parameter<bool>("active", false);
     publish_scan_debug_ = declare_parameter<bool>("publish_scan_debug", true);
 
     proj_cfg_.height_min = declare_parameter<double>("height_min", proj_cfg_.height_min);
     proj_cfg_.height_max = declare_parameter<double>("height_max", proj_cfg_.height_max);
-    proj_cfg_.z_offset = declare_parameter<double>("z_offset", proj_cfg_.z_offset);
     proj_cfg_.angle_bins = declare_parameter<int>("angle_bins", proj_cfg_.angle_bins);
     proj_cfg_.range_min = declare_parameter<double>("range_min", proj_cfg_.range_min);
     proj_cfg_.range_max = declare_parameter<double>("range_max", proj_cfg_.range_max);
-    proj_cfg_.flip_x = declare_parameter<bool>("flip_x", proj_cfg_.flip_x);
-    proj_cfg_.flip_y = declare_parameter<bool>("flip_y", proj_cfg_.flip_y);
     proj_cfg_.enable_low_band =
       declare_parameter<bool>("enable_low_band", proj_cfg_.enable_low_band);
     proj_cfg_.low_height_min =
@@ -234,7 +259,7 @@ private:
     follow_cfg_.lost_frames_timeout =
       declare_parameter<int>("lost_frames_timeout", follow_cfg_.lost_frames_timeout);
     follow_cfg_.auto_select_front =
-      declare_parameter<bool>("auto_select_front", follow_cfg_.auto_select_front);
+      declare_parameter<bool>("auto_select_front", false);
     follow_cfg_.auto_front_fov_deg =
       declare_parameter<double>("auto_front_fov_deg", follow_cfg_.auto_front_fov_deg);
     follow_cfg_.auto_select_max_range =
@@ -263,17 +288,9 @@ private:
       declare_parameter<bool>("auto_frame", follow_cfg_.auto_frame);
     follow_cfg_.self_occlusion_margin =
       declare_parameter<double>("self_occlusion_margin", follow_cfg_.self_occlusion_margin);
-    follow_cfg_.sensor_height =
-      declare_parameter<double>("sensor_height", follow_cfg_.sensor_height);
-    follow_cfg_.ground_clearance =
-      declare_parameter<double>("ground_clearance", follow_cfg_.ground_clearance);
-    follow_cfg_.band_separation =
-      declare_parameter<double>("band_separation", follow_cfg_.band_separation);
     follow_cfg_.governor.emergency_floor =
       declare_parameter<double>("governor_emergency_floor",
                                 follow_cfg_.governor.emergency_floor);
-    follow_cfg_.auto_low_band =
-      declare_parameter<bool>("auto_low_band", follow_cfg_.auto_low_band);
 
     // --- gap-based local steering (VFH+) ---
     follow_cfg_.vfh.enable =
@@ -294,7 +311,7 @@ private:
       declare_parameter<double>("vfh_max_turn_deg", follow_cfg_.vfh.max_turn_deg);
 
     // --- P2 recovery / target search ---
-    recovery_cfg_.enable = declare_parameter<bool>("recovery_enable", recovery_cfg_.enable);
+    recovery_cfg_.enable = declare_parameter<bool>("recovery_enable", false);
     recovery_cfg_.stuck_window =
       declare_parameter<double>("recovery_stuck_window", recovery_cfg_.stuck_window);
     recovery_cfg_.stuck_dist =
@@ -310,7 +327,7 @@ private:
     recovery_cfg_.max_attempts =
       declare_parameter<int>("recovery_max_attempts", recovery_cfg_.max_attempts);
 
-    search_cfg_.enable = declare_parameter<bool>("search_enable", search_cfg_.enable);
+    search_cfg_.enable = declare_parameter<bool>("search_enable", false);
     search_cfg_.coast_time =
       declare_parameter<double>("search_coast_time", search_cfg_.coast_time);
     search_cfg_.spin_timeout =
@@ -354,25 +371,114 @@ private:
       declare_parameter<double>("max_angular_jerk", smoother_cfg_.max_angular_jerk);
   }
 
+  bool lookupTransform(const std::string & source,
+    const builtin_interfaces::msg::Time & stamp, RigidTransform & transform)
+  {
+    if (source.empty() || stamp.sec < 0 || stamp.nanosec >= 1000000000u ||
+      (stamp.sec == 0 && stamp.nanosec == 0)) {return false;}
+    transform = RigidTransform{};
+    if (source == control_frame_) {return true;}
+    try {
+      const auto stamped = tf_buffer_->lookupTransform(
+        control_frame_, source, rclcpp::Time(stamp, get_clock()->get_clock_type()));
+      const auto & q = stamped.transform.rotation;
+      const auto & t = stamped.transform.translation;
+      if (!std::isfinite(q.x) || !std::isfinite(q.y) || !std::isfinite(q.z) ||
+        !std::isfinite(q.w) || !std::isfinite(t.x) || !std::isfinite(t.y) ||
+        !std::isfinite(t.z)) {return false;}
+      tf2::Quaternion rotation(q.x, q.y, q.z, q.w);
+      if (rotation.length2() <= 0.0) {return false;}
+      rotation.normalize();
+      const tf2::Matrix3x3 matrix(rotation);
+      for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+          transform.rotation[row * 3 + col] = matrix[row][col];
+        }
+      }
+      transform.translation = {t.x, t.y, t.z};
+      return true;
+    } catch (const tf2::TransformException & error) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "stamped TF unavailable: %s", error.what());
+      return false;
+    }
+  }
+
+  void invalidateCloud(const builtin_interfaces::msg::Time & stamp, bool display_due)
+  {
+    have_cloud_ = false;
+    last_scan_valid_ = false;
+    last_scan_ = ScanFrame();
+    active_ = false;
+    have_target_observation_ = false;
+    controller_.clearTarget();
+    last_result_ = FollowResult();
+    stopNow();
+    pending_empty_viz_ = true;
+    empty_viz_stamp_ = stamp;
+    if (display_due) {publishCloudViz(stamp, {});}
+    visualization_msgs::msg::Marker marker;
+    marker.header.stamp = stamp;
+    marker.header.frame_id = control_frame_;
+    marker.ns = "rs_follow";
+    marker.id = 0;
+    marker.action = visualization_msgs::msg::Marker::DELETE;
+    marker_pub_->publish(marker);
+    publishStatus();
+  }
+
   void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
   {
-    ScanFrame scan;
-    if (!projectPointCloud(*msg, proj_cfg_, scan)) {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 5000,
-        "cannot project cloud (missing x/y/z FLOAT32 fields?) topic=%s", input_topic_.c_str());
+    const auto now_tp = std::chrono::steady_clock::now();
+    const bool display_due = !pending_empty_viz_ &&
+      cloud_viz_pub_->get_subscription_count() > 0 &&
+      (!have_viz_publish_ || std::chrono::duration<double>(
+      now_tp - last_viz_publish_).count() >= 0.2);
+    const auto & stamp = msg->header.stamp;
+    const bool valid_stamp = stamp.sec >= 0 && stamp.nanosec < 1000000000u &&
+      (stamp.sec != 0 || stamp.nanosec != 0);
+    const int64_t stamp_ns = static_cast<int64_t>(stamp.sec) * 1000000000LL + stamp.nanosec;
+    const bool stamp_gap = have_cloud_stamp_ && stamp_ns - last_cloud_stamp_ns_ > 1000000000LL;
+    if (stamp_gap) {
+      ScanFrame discontinuity;
+      discontinuity.stamp = rclcpp::Time(stamp);
+      controller_.update(discontinuity);
+      invalidateCloud(stamp, display_due);
+      have_cloud_stamp_ = true;
+      last_cloud_stamp_ns_ = stamp_ns;
       return;
     }
-
-    last_scan_ = scan;
+    RigidTransform transform;
+    ScanFrame scan;
+    std::vector<PointXYZ> display;
+    if (!valid_stamp || (have_cloud_stamp_ && stamp_ns <= last_cloud_stamp_ns_) ||
+      !lookupTransform(msg->header.frame_id, stamp, transform) ||
+      !projectPointCloud(*msg, proj_cfg_, scan, transform, control_frame_,
+      display_due ? &display : nullptr) ||
+      (scan.valid_bins == 0 && scan.valid_low_bins == 0))
+    {
+      invalidateCloud(stamp, display_due);
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "rejecting cloud: invalid stamp, stamped TF, layout, or empty projection");
+      return;
+    }
+    have_cloud_stamp_ = true;
+    last_cloud_stamp_ns_ = stamp_ns;
+    if (display_due) {publishCloudViz(stamp, display);}
+    last_scan_ = std::move(scan);
     last_scan_valid_ = true;
-    last_result_ = controller_.update(scan);
-    last_cloud_time_ = now();
+    last_result_ = controller_.update(last_scan_);
+    have_cloud_ = true;
+    last_cloud_time_ = now_tp;
+    if (last_result_.target_observed) {
+      have_target_observation_ = true;
+      last_target_observation_ = last_cloud_time_;
+    }
 
     if (publish_scan_debug_) {
-      publishScan(scan);
+      publishScan(last_scan_);
     }
-    publishTarget(scan);
+    publishTarget(last_scan_);
     publishStatus();
 
     RCLCPP_INFO_THROTTLE(
@@ -391,17 +497,55 @@ private:
       last_result_.cmd.linear.x, last_result_.cmd.linear.y, last_result_.cmd.angular.z);
   }
 
+  static bool finiteTwist(const geometry_msgs::msg::Twist & cmd)
+  {
+    return std::isfinite(cmd.linear.x) && std::isfinite(cmd.linear.y) &&
+           std::isfinite(cmd.linear.z) && std::isfinite(cmd.angular.x) &&
+           std::isfinite(cmd.angular.y) && std::isfinite(cmd.angular.z);
+  }
+
+  void resetCommands()
+  {
+    smoother_.reset();
+    last_result_.cmd = geometry_msgs::msg::Twist();
+    direct_vx_ = direct_vy_ = direct_wz_ = 0.0;
+    have_direct_ = false;
+    last_pub_vx_ = last_pub_vy_ = last_pub_wz_ = 0.0;
+    controller_.setOdomTwist(0.0, 0.0, 0.0);
+    recovery_active_ = false;
+    recovery_.reset();
+    search_.reset();
+  }
+
+  void stopNow()
+  {
+    resetCommands();
+    if (cmd_pub_) {cmd_pub_->publish(geometry_msgs::msg::Twist());}
+  }
+
+  std::string validateBinding(const geometry_msgs::msg::PointStamped & point,
+    geometry_msgs::msg::PointStamped & target)
+  {
+    const bool fresh = have_cloud_ && std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - last_cloud_time_).count() <= cmd_timeout_;
+    const auto reason = validateBindingPoint(point, last_scan_valid_ ? &last_scan_ : nullptr,
+      fresh, cmd_timeout_, control_frame_, proj_cfg_.body,
+      [this](const std::string & source, const builtin_interfaces::msg::Time & stamp,
+        RigidTransform & transform) {return lookupTransform(source, stamp, transform);},
+      controller_, target);
+    if (reason != "OK") {return reason;}
+    have_target_observation_ = true;
+    last_target_observation_ = last_cloud_time_;
+    last_result_ = FollowResult();
+    stopNow();
+    return reason;
+  }
+
   void clickedCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg)
   {
-    if (!last_scan_valid_) {
-      RCLCPP_WARN(get_logger(), "no scan yet, cannot bind target");
-      return;
-    }
-    const bool snapped = controller_.bindTarget(msg->point.x, msg->point.y, last_scan_);
-    RCLCPP_INFO(
-      get_logger(), "bind target (%.2f, %.2f) snapped=%s -> (%.2f, %.2f)",
-      msg->point.x, msg->point.y, snapped ? "yes" : "no",
-      controller_.targetX(), controller_.targetY());
+    geometry_msgs::msg::PointStamped target;
+    const auto reason = validateBinding(*msg, target);
+    RCLCPP_INFO(get_logger(), "bind target: %s", reason.c_str());
   }
 
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
@@ -438,34 +582,70 @@ private:
   void controlTimer()
   {
     const auto now_tp = std::chrono::steady_clock::now();
+    if (pending_empty_viz_ && cloud_viz_pub_->get_subscription_count() > 0 &&
+      (!have_viz_publish_ || std::chrono::duration<double>(
+      now_tp - last_viz_publish_).count() >= 0.2))
+    {publishCloudViz(empty_viz_stamp_, {});}
     const double dt = std::chrono::duration<double>(now_tp - last_tick_time_).count();
     last_tick_time_ = now_tp;
-    fsm_time_ += dt;
+    // WallTimer remains live when /clock stops; only motion time follows ROS time.
+    const int64_t ros_ns = now().nanoseconds();
+    const bool sim_time = get_clock()->ros_time_is_active();
+    const double motion_dt = sim_time ? (have_tick_ros_time_ ?
+      static_cast<double>(ros_ns - last_tick_ros_ns_) * 1e-9 : 0.0) : dt;
+    have_tick_ros_time_ = true;
+    last_tick_ros_ns_ = ros_ns;
+    const bool time_paused = sim_time && motion_dt <= 0.0;
+    const bool time_discontinuous = sim_time && (motion_dt < 0.0 || motion_dt > 1.0);
+    if (!sim_time || motion_dt > 0.0) {last_ros_advance_time_ = now_tp;}
+    const bool clock_frozen = time_paused && std::chrono::duration<double>(
+      now_tp - last_ros_advance_time_).count() > cmd_timeout_;
+    if (clock_frozen || time_discontinuous) {
+      active_ = false;
+      have_cloud_ = false;
+      last_scan_valid_ = false;
+      last_scan_ = ScanFrame();
+      have_target_observation_ = false;
+      controller_.clearTarget();
+      last_result_ = FollowResult();
+      resetCommands();
+      if (time_discontinuous) {
+        have_cloud_stamp_ = false;
+        controller_.reset();
+      }
+    }
+    if (!time_paused && !time_discontinuous) {fsm_time_ += motion_dt;}
 
-    const double age = (now() - last_cloud_time_).seconds();
-    const bool fresh = age < cmd_timeout_;
+    const bool fresh = have_cloud_ &&
+      std::chrono::duration<double>(now_tp - last_cloud_time_).count() <= cmd_timeout_;
+    // Sensor recovery must not resume motion without an explicit enable.
+    if (!fresh) {active_ = false;}
+    const bool observed = have_target_observation_ &&
+      std::chrono::duration<double>(now_tp - last_target_observation_).count() <=
+      target_observation_timeout_;
+    if (have_target_observation_ && !observed) {
+      if (control_mode_ == 1) {active_ = false;}
+      have_target_observation_ = false;
+      controller_.clearTarget();
+      last_result_ = FollowResult();
+    } else if (control_mode_ == 1 && active_ && !observed) {
+      active_ = false;
+    }
+    const bool direct_fresh = have_direct_ &&
+      std::chrono::duration<double>(now_tp - last_direct_time_).count() <= direct_cmd_timeout_;
+    const bool stop_gate = estop_ || !active_ || !fresh ||
+      (control_mode_ == 0 && !direct_fresh);
 
     geometry_msgs::msg::Twist desired;  // zero unless a valid, fresh command exists
     bool emergency = false;
-    if (active_ && fresh) {
+    if (!stop_gate) {
       if (control_mode_ == 0) {                 // DIRECT (joystick)
         desired.linear.x = direct_vx_;
         desired.linear.y = direct_vy_;
         desired.angular.z = direct_wz_;
       } else if (last_result_.target_valid) {   // FOLLOW
-        if (last_result_.emergency_stop) {
-          // Hard stop: no translation may continue. The controller still emits
-          // a bounded in-place rotation so the robot can turn out of the corner
-          // it was stopped by; passing it through the smoother would defeat the
-          // instant stop, so it is applied directly below.
-          emergency = true;
-          // The controller emits a bounded escape command (in-place rotation,
-          // plus reverse/strafe that provably increase clearance). It must
-          // reach the base unfiltered, so it bypasses the smoother.
-          emergency_cmd_ = last_result_.cmd;
-        } else {
-          desired = last_result_.cmd;
-        }
+        emergency = last_result_.emergency_stop;
+        if (!emergency) {desired = last_result_.cmd;}
         // The tracker has the person: remember where, so a later loss can be
         // searched for instead of ending in a permanent stall.
         search_.noteSighting(fsm_time_, pose_x_, pose_y_);
@@ -486,16 +666,8 @@ private:
       }
 
       // ---- P2: stuck recovery ----
-      //
-      // This runs EVEN WHILE THE HARD STOP IS ACTIVE. Gating it on
-      // `!emergency` was self-defeating: a wide obstacle (a 1 m step against a
-      // 0.36 m body) leaves no traversable heading at the current pose, so the
-      // controller can only rotate, the robot never translates, and the very
-      // state that needs recovery was the one state recovery was not allowed to
-      // act in. The machine's own outputs are bounded and it is the only path
-      // that reverses out to where a gap becomes reachable again.
       double rvx = 0.0, rvy = 0.0, rwz = 0.0;
-      const bool rcmd = (control_mode_ != 0 && last_result_.target_valid &&
+      const bool rcmd = (!emergency && control_mode_ != 0 && last_result_.target_valid &&
         recovery_.update(fsm_time_, pose_x_, pose_y_, pose_yaw_,
                          desired.linear.x, desired.linear.y, desired.angular.z,
                          last_result_.clearance_rear, &rvx, &rvy, &rwz));
@@ -503,14 +675,10 @@ private:
         desired.linear.x = rvx;
         desired.linear.y = rvy;
         desired.angular.z = rwz;
-        emergency = false;          // recovery motion must reach the base
         recovery_active_ = true;
       } else {
         recovery_active_ = false;
       }
-    } else if (active_ && !fresh) {
-      // lost the sensor: nothing to search with, stand still
-      desired = geometry_msgs::msg::Twist();
     }
 
     // slip / speed compensation (follow only)
@@ -523,9 +691,17 @@ private:
       desired.angular.z = std::clamp(desired.angular.z, -max_angular_cmd_, max_angular_cmd_);
     }
 
-    geometry_msgs::msg::Twist out = smoother_.step(desired, dt, emergency);
-    if (emergency) {
-      out = emergency_cmd_;
+    geometry_msgs::msg::Twist out;
+    if (time_paused && !stop_gate && !emergency && finiteTwist(desired)) {
+      // No simulation-time advancement: publish zero without evolving the smoother.
+    } else if (stop_gate || emergency || !finiteTwist(desired)) {
+      resetCommands();
+    } else {
+      out = smoother_.step(desired, motion_dt, false);
+      if (!finiteTwist(out)) {
+        out = geometry_msgs::msg::Twist();
+        resetCommands();
+      }
     }
     // feed the actually-commanded motion back so the target filter can work in
     // an inertial frame (compensates the robot's own rotation)
@@ -535,6 +711,17 @@ private:
     last_pub_vx_ = out.linear.x;
     last_pub_vy_ = out.linear.y;
     last_pub_wz_ = out.angular.z;
+    // A paused, freshly bound target remains selectable for an explicit start.
+    // Prediction and cached target messages never extend observation validity.
+    const bool target_valid = !estop_ && fresh && observed && controller_.targetValid();
+    char control_state_json[96];
+    std::snprintf(control_state_json, sizeof(control_state_json),
+      "{\"active\":%s,\"mode\":%d,\"estop\":%s,\"target_valid\":%s}",
+      active_ ? "true" : "false", control_mode_, estop_ ? "true" : "false",
+      target_valid ? "true" : "false");
+    std_msgs::msg::String control_state;
+    control_state.data = control_state_json;
+    control_state_pub_->publish(control_state);
 
     // ---- diagnostics: which FSM is acting, and how far the robot got ----
     // Machine-readable state, sampled by the acceptance harness. The numbers
@@ -564,6 +751,43 @@ private:
     std_msgs::msg::String st;
     st.data = buf;
     state_pub_->publish(st);
+  }
+
+  void publishCloudViz(const builtin_interfaces::msg::Time & stamp,
+    const std::vector<PointXYZ> & points)
+  {
+    sensor_msgs::msg::PointCloud2 out;
+    out.header.stamp = stamp;
+    out.header.frame_id = control_frame_;
+    out.height = 1;
+    out.width = static_cast<uint32_t>(points.size());
+    out.is_bigendian = false;
+    out.is_dense = true;
+    out.point_step = 12;
+    out.row_step = out.width * out.point_step;
+    out.fields.resize(3);
+    for (size_t axis = 0; axis < 3; ++axis) {
+      out.fields[axis].name = axis == 0 ? "x" : (axis == 1 ? "y" : "z");
+      out.fields[axis].offset = static_cast<uint32_t>(axis * 4);
+      out.fields[axis].datatype = sensor_msgs::msg::PointField::FLOAT32;
+      out.fields[axis].count = 1;
+    }
+    out.data.resize(out.row_step);
+    for (size_t index = 0; index < points.size(); ++index) {
+      const float values[] = {points[index].x, points[index].y, points[index].z};
+      for (size_t axis = 0; axis < 3; ++axis) {
+        uint32_t bits;
+        std::memcpy(&bits, &values[axis], sizeof(bits));
+        for (size_t byte = 0; byte < 4; ++byte) {
+          out.data[index * 12 + axis * 4 + byte] =
+            static_cast<uint8_t>((bits >> (byte * 8)) & 0xffu);
+        }
+      }
+    }
+    cloud_viz_pub_->publish(out);
+    last_viz_publish_ = std::chrono::steady_clock::now();
+    have_viz_publish_ = true;
+    pending_empty_viz_ = false;
   }
 
   void publishScan(const ScanFrame & scan)
@@ -623,11 +847,11 @@ private:
       (last_result_.emergency_stop ? "EMERGENCY_STOP" :
       (last_result_.target_manual ? "TRACKING_MANUAL" : "TRACKING_AUTO")) : "NO_TARGET";
     status_pub_->publish(s);
-    last_scan_valid_ = true;
   }
 
   // topics
   std::string input_topic_;
+  std::string control_frame_;
   std::string cmd_vel_topic_;
   std::string odom_topic_ = "/odom";
 
@@ -642,7 +866,6 @@ private:
   SearchConfig search_cfg_;
   double fsm_time_ = 0.0;
   bool recovery_active_ = false;
-  geometry_msgs::msg::Twist emergency_cmd_;
   double pose_x_ = 0.0, pose_y_ = 0.0, pose_yaw_ = 0.0;
   bool have_pose_ = false;
   CmdSmoother smoother_;
@@ -655,11 +878,28 @@ private:
   double direct_vx_ = 0.0, direct_vy_ = 0.0, direct_wz_ = 0.0;
   double control_rate_hz_ = 50.0;
   double cmd_timeout_ = 0.5;
-  rclcpp::Time last_cloud_time_;
+  double direct_cmd_timeout_ = 0.3;
+  double target_observation_timeout_ = 0.5;
+  bool estop_ = false;
+  bool have_cloud_ = false;
+  bool have_direct_ = false;
+  bool have_target_observation_ = false;
+  bool have_cloud_stamp_ = false;
+  int64_t last_cloud_stamp_ns_ = 0;
+  bool have_viz_publish_ = false;
+  bool pending_empty_viz_ = false;
+  builtin_interfaces::msg::Time empty_viz_stamp_;
+  std::chrono::steady_clock::time_point last_viz_publish_{};
+  std::chrono::steady_clock::time_point last_cloud_time_{};
+  std::chrono::steady_clock::time_point last_direct_time_{};
+  std::chrono::steady_clock::time_point last_target_observation_{};
   std::chrono::steady_clock::time_point last_tick_time_ = std::chrono::steady_clock::now();
+  bool have_tick_ros_time_ = false;
+  int64_t last_tick_ros_ns_ = 0;
+  std::chrono::steady_clock::time_point last_ros_advance_time_ = std::chrono::steady_clock::now();
 
   // slip / speed compensation
-  bool compensate_slip_ = true;
+  bool compensate_slip_ = false;
   double slip_min_ratio_ = 0.3;
   double slip_max_ratio_ = 2.5;
   double slip_filter_alpha_ = 0.1;
@@ -681,13 +921,19 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enable_sub_;
   rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr mode_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr direct_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr estop_sub_;
+  rclcpp::Service<rs_follow_interfaces::srv::BindTarget>::SharedPtr bind_service_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr scan_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr target_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr target_raw_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_viz_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr control_state_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_pub_;
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   rclcpp::TimerBase::SharedPtr control_timer_;
 };
 

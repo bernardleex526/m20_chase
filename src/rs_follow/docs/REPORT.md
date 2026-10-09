@@ -9,6 +9,12 @@
 
 ---
 
+本文 §0–3、§5–6 保留 `2cd0f6d` 的历史 WSL/Gazebo 证据与复现口径，含传感器帧高度带和旧自遮挡行为；这些结论不是当前分支或硬件的验收结果。当前运行指导见 §4 与 [包 README](../README.md)。
+
+当前软件证据：四包构建通过、colcon 85 项零失败、pytest 77 项通过；坐标 DDS 8/8（带 stamp 旋转/平移、精确时间 TF、同帧、headers、5 Hz/0.1 m 体素/6000 点、自过滤、故障即时归零 0.0007–0.0017 s）。step1 direct_timeout 0.3090 s、binding/observation 0.5020 s、estop 0.0004 s、cloud_loss 0.5076 s 通过；缓存 clangd 四个符号引用检查成功。
+
+最终消费者场景 13/13 PASS，包含 `EMERGENCY_STOP` 六分量归零；四个 C++ 测试重跑通过、colcon 85 项零失败、governor diagnostic 0。此前 12/13（`emergency_obstacle` vx=0.855）的旧 fixture 将 0.30 m 点放进前界 0.36 m 自遮挡盒。最终仅修正消费者 fixture：低障碍 0.45 m 位于手动前界 0.39 m 外，低带 `[-0.6,-0.5]` 与目标带不相交，六零断言加强；VFH 保持启用，生产配置及其他 fixtures 未改变。`follow_acceptance --case all` 仍退出 2，crossing/clock_pause 尚未覆盖。完整证据与最终修正见 [step3 报告](../../../.omp/reports/step3.md)。没有硬件验证；平地、低速、受控场景的几何跟随不保证目标身份。
+
 ## 0. 结论速览
 
 | 问题 | 结论 |
@@ -431,17 +437,17 @@ cmd 全零且状态为 `EMERGENCY_STOP`；`loss` 在目标消失后估计标记�
 
 ## 4. 上真机前的必做项
 
-1. **雷达必须抬高到机体轮廓之上**。本测试第一版把雷达放在机体中心，传感器看到自身机身（~0.3 m）直接触发 `apf_emergency` 把 `/cmd_vel` 钉死为零。真机上雷达不能平齐或低于机体，或必须把机体自身点云通过 `frame_front/frame_back/frame_left/frame_right` 排除掉。
-2. **标定 `height_min` / `height_max`**。地面点占 97%（见 §2.1），这两个参数按「雷达离地高度 + 行人高度范围」设定；本测试用 `-0.60 / 1.50`（雷达 z=0.95）。标错会直接导致目标点簇被地面淹没或目标躯干被滤掉。
-3. **确认雷达朝向**。`flip_x` / `flip_y` 或 TF 修正；本测试假设 `frame_id=rslidar` 与机体同向（x 前 / y 左 / z 上）。
-4. **首测保持 `active=false`**，先看 `/rs_follow/scan`（投影扫描）与 `/cmd_vel`，再逐步使能——本次测试验证了该安全闸确实有效（§2.5 F）。
+1. **测量外参**：默认 `control_frame=base_link`（+x 前、+y 左、+z 上）。用实测 URDF/TF 表达雷达安装旋转和平移，确认每帧非零源 stamp 对应 TF 可用；节点已按精确时间变换，不回退最新 TF。同帧合成 `rslidar` 仅是软件回环。
+2. **标定控制帧高度带**：实测变换后地面、目标、低障碍的 z 范围，分别配置 `height_min/max` 与显式 `low_height_min/max`，不从传感器高度推导。历史 `-0.60 / 1.50` 不用于当前 base_link。硬件 TF/带未实测时保持 `active=false`、低位带关闭。
+3. **共享自遮挡盒**：按实体轮廓标定 `frame_*` 或 `auto_frame` 尺寸/余量。归一化自遮挡盒同时用于投影与控制器，先排除机体点再取 bin 最近回波。旧 0.30 m emergency fixture 被盒排除，最终已用盒外低障碍验证六分量急停；这项软件通过不能代替真实外廓测量或证明全工况安全。
+4. **先观察再显式使能**：检查 `/rs_follow/scan` 与真实源 XYZ `/rs_follow/cloud_viz`（控制帧/源 stamp、带外点保留、自身点排除、0.1 m 体素、6000 点上限、订阅者驱动最多 5 Hz）。绑定点必须带非零有效 stamp/frame，按请求时间 TF 变换后事务提交；失败保留旧目标且不启用。云布局/stamp/TF 故障立即六分量归零、清缓存并暂停，后续有效云需配合显式重启，不能自动恢复。
 5. **`enable_lateral`**：真机为全向底盘才设 `true`；差速底盘必须设 `false`，否则 `linear.y` 会被丢弃或造成异常。
 6. 机器狗比轮式更怕顿挫，README 建议 `max_linear_accel: 0.5`、`max_angular_accel: 1.0`。
 7. **避障四项（§3.4.4）**：把本体真实外廓标进 `frame_*`、补后向安全门限、把被跟踪目标的 bin 从障碍判定中排除（否则站距 <0.45 m 不可用）、若场景有固定障碍则必须外接 `Nav2` 或自写绕行状态机——**该仓库本身不会绕行**。
 
 ---
 
-## 5. 复现方式
+## 5. 历史版本复现方式
 
 ```bash
 # 1. 克隆并切分支

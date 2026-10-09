@@ -14,7 +14,7 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <chrono>
+#include <cstdint>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -29,7 +29,7 @@
 namespace rs_follow
 {
 
-struct FollowConfig
+struct FollowConfig : BodyFrameConfig
 {
   // desired standoff distance and cluster radius
   double follow_dist = 1.0;
@@ -64,11 +64,6 @@ struct FollowConfig
   double apf_emergency = 0.35;
   double apf_slowdown = 0.7;
 
-  // robot self-occlusion box in lidar frame (x forward, y left)
-  double frame_front = 0.25;
-  double frame_back = 0.45;
-  double frame_left = 0.25;
-  double frame_right = 0.25;
 
   // target filtering / loss handling
   bool enable_kalman = true;
@@ -114,54 +109,9 @@ struct FollowConfig
   // Time-to-collision speed governor (replaces the fixed-radius e-stop).
   GovernorConfig governor;
 
-  // Robot outline (m), used to convert a sensor range into a TRUE clearance
-  // between the obstacle and the robot's body. Without this the governor
-  // believes a wall 0.30 m to the side leaves 0.30 m of room, while the body
-  // half-width already consumes 0.18 m of it.
-  // Clearance along bearing a is  range(a) - support(a), where the support
-  // function of a w x l box is  0.5*(l*|cos a| + w*|sin a|).
-  double robot_length = 0.62;
-  double robot_width = 0.36;
   // How long to keep rotating in place when the person is behind the robot
   // before allowing a slow reverse. Prevents an endless pirouette.
   double behind_rotate_timeout = 2.5;
-  // Derive the self-occlusion rectangle from the outline above. The two MUST
-  // agree: with a hand-set frame_front smaller than half the body, the robot's
-  // own chassis sticks out of the exclusion box and is treated as an obstacle.
-  // That is exactly what happened when the low band started seeing the body.
-  bool auto_frame = true;
-  // Margin on the self-occlusion box. Keep it SMALL: the box is a rectangle in
-  // x/y, so everything inside it is silently ignored, including real obstacles.
-  // At 0.08 m the box reached 0.39 m ahead, and a pedestrian 0.42 m away sat
-  // right on that boundary -- its returns were filtered as "self" while
-  // min_obstacle still reported them, leaving the speed limit at infinity
-  // (d_slow=-1) and the robot driving into it. The body's own returns all come
-  // from its top surface, which is only ~0.21-0.31 m ahead horizontally for a
-  // lidar 0.25 m above it, so a 0.05 m margin is enough to contain them.
-  double self_occlusion_margin = 0.05;
-  // Height of the lidar above the floor (m) and the clearance kept above the
-  // ground. The LOW band is derived from these so it can never contain ground
-  // returns: ground sits at sensor z = -sensor_height, and a band that reached
-  // it would fill all 360 bins with the floor and mask the person entirely.
-  double sensor_height = 0.75;
-  double ground_clearance = 0.10;
-  // Derive low_height_* from the two values above (recommended). Set false only
-  // if the low band must be pinned to explicit limits.
-  bool auto_low_band = true;
-  // Gap between the low band's top and the target band's bottom (m).
-  //
-  // Keep this ~0. A large value opens a DEAD ZONE that no band covers: with
-  // 0.15 m the low band topped out at world 0.20 m while the target band began
-  // at 0.35 m, so a 0.30 m step had its entire top face in the gap and the
-  // planner saw nothing there at all (vfh_free reported 49.7 m -- "totally
-  // clear" -- while the step was 0.6 m ahead). Only the step's thin front face
-  // was visible, and that is missed entirely from some angles.
-  //
-  // Adjacent bands have no such hole. A low obstacle still cannot be mistaken
-  // for the person because the ray-based exclusion removes the person's own
-  // returns from the obstacle set, and the person's torso is far taller than
-  // the low band's ceiling.
-  double band_separation = 0.02;
 
   // Gap-based local steering. Without it the controller can only nudge or
   // stop; with it, a traversable gap is actually taken.
@@ -206,22 +156,14 @@ public:
   explicit FollowController(const FollowConfig & cfg = FollowConfig())
   : cfg_(cfg)
   {
+    static_cast<BodyFrameConfig &>(cfg_) = normalizeBodyFrame(cfg_);
     applyKalmanConfig();
   }
 
   void setConfig(const FollowConfig & cfg)
   {
     cfg_ = cfg;
-    if (cfg_.auto_frame) {
-      // Self-occlusion box = the body's own footprint plus a margin, so no
-      // return from the robot itself can ever be mistaken for an obstacle.
-      const double half_l = 0.5 * cfg_.robot_length + cfg_.self_occlusion_margin;
-      const double half_w = 0.5 * cfg_.robot_width + cfg_.self_occlusion_margin;
-      cfg_.frame_front = half_l;
-      cfg_.frame_back = half_l;
-      cfg_.frame_left = half_w;
-      cfg_.frame_right = half_w;
-    }
+    static_cast<BodyFrameConfig &>(cfg_) = normalizeBodyFrame(cfg_);
 
     governor_.setConfig(cfg_.governor);
     // The planner's "traversable" clearance must be strictly larger than the
@@ -430,6 +372,13 @@ public:
     kalman_.reset();
     target_x_ = cfg_.follow_dist;
     target_y_ = 0.0;
+    have_scan_stamp_ = false;
+    require_rebind_ = true;
+    behind_time_ = 0.0;
+    prev_dir_ = 0.0;
+    obs_ranges_.clear();
+    prev_obs_ranges_.clear();
+    obs_closing_.clear();
   }
 
   void clearTarget()
@@ -441,6 +390,11 @@ public:
     angular_dir_ = 0;
     linear_integral_ = 0.0;
     kalman_.reset();
+    behind_time_ = 0.0;
+    prev_dir_ = 0.0;
+    obs_ranges_.clear();
+    prev_obs_ranges_.clear();
+    obs_closing_.clear();
   }
 
   bool targetValid() const {return target_valid_;}
@@ -450,22 +404,34 @@ public:
 
   /**
    * @brief Bind a target from a clicked/selected point (lidar frame).
-   * Snaps to the nearest scan return within bind_radius when possible.
+   * Returns true only after snapping to a target-band return within bind_radius.
+   * Failure leaves the previous target and tracking state unchanged.
    */
   bool bindTarget(double x, double y, const ScanFrame & scan)
   {
+    if (!std::isfinite(x) || !std::isfinite(y)) {
+      return false;
+    }
     double best_x = x, best_y = y;
     double best_d2 = cfg_.bind_radius * cfg_.bind_radius;
     bool snapped = false;
 
     for (int i = 0; i < static_cast<int>(scan.ranges.size()); ++i) {
-      if (!std::isfinite(scan.ranges[static_cast<size_t>(i)])) {
+      if (!std::isfinite(scan.ranges[static_cast<size_t>(i)]) ||
+        scan.ranges[static_cast<size_t>(i)] <= 0.0f)
+      {
         continue;
       }
       const double a = scan.angleAt(i);
       const double r = scan.ranges[static_cast<size_t>(i)];
       const double px = r * std::cos(a);
       const double py = r * std::sin(a);
+      if (!std::isfinite(px) || !std::isfinite(py) ||
+        (px > -cfg_.frame_back && px < cfg_.frame_front &&
+        py > -cfg_.frame_right && py < cfg_.frame_left))
+      {
+        continue;
+      }
       const double d2 = (px - x) * (px - x) + (py - y) * (py - y);
       if (d2 < best_d2) {
         best_d2 = d2;
@@ -473,6 +439,9 @@ public:
         best_y = py;
         snapped = true;
       }
+    }
+    if (!snapped) {
+      return false;
     }
 
     target_x_ = best_x;
@@ -490,8 +459,8 @@ public:
       }
       kalman_.setState(sx, sy);
     }
-    last_obs_time_ = std::chrono::steady_clock::now();
-    return snapped;
+    require_rebind_ = false;
+    return true;
   }
 
   /**
@@ -501,18 +470,31 @@ public:
   {
     FollowResult res;
 
-    // control period (for integral action)
-    auto now_tp = std::chrono::steady_clock::now();
-    double dt = std::chrono::duration<double>(now_tp - last_control_time_).count();
-    last_control_time_ = now_tp;
-    dt = std::clamp(dt, 0.02, 0.5);
+    // Estimator and control time is sensor time, independent of playback speed.
+    const int64_t stamp_ns = scan.stamp.nanoseconds();
+    if (stamp_ns < 0 || (have_scan_stamp_ && stamp_ns <= last_scan_stamp_ns_))
+    {
+      linear_integral_ = 0.0;
+      behind_time_ = 0.0;
+      prev_obs_ranges_.clear();
+      return res;
+    }
+    const double dt = have_scan_stamp_ ?
+      static_cast<double>(stamp_ns - last_scan_stamp_ns_) * 1e-9 : 0.0;
+    last_scan_stamp_ns_ = stamp_ns;
+    have_scan_stamp_ = true;
+    if (dt > 1.0) {
+      clearTarget();
+      require_rebind_ = true;
+      return res;
+    }
 
     if (cfg_.filter_in_world && !has_odom_pose_) {
       integrateOdom(dt);
     }
 
     // ---- target acquisition ----
-    if (!target_valid_ && cfg_.auto_select_front) {
+    if (!target_valid_ && cfg_.auto_select_front && !require_rebind_) {
       autoSelectFront(scan);
     }
     if (!target_valid_) {
@@ -568,12 +550,6 @@ public:
     // is the real surface-to-surface gap in the nearest direction.
     double min_clearance_omni = std::numeric_limits<double>::infinity();
     double nearest_omni_bearing = 0.0;
-    double nearest_omni_px = 0.0, nearest_omni_py = 0.0;
-    double nearest_omni_vx = 0.0, nearest_omni_vy = 0.0;
-  double prev_nearest_px_ = 0.0, prev_nearest_py_ = 0.0;
-  double filt_obs_vx_ = 0.0, filt_obs_vy_ = 0.0;
-  double obs_vel_alpha_ = 0.4;
-  bool have_prev_nearest_ = false;
 
     // Direction-gated clearance. `min_obstacle` (kept for logging/back-compat)
     // is the omnidirectional minimum; the values actually used for safety are
@@ -693,8 +669,6 @@ public:
         if (omni_clr < min_clearance_omni) {
           min_clearance_omni = omni_clr;
           nearest_omni_bearing = a;
-          nearest_omni_px = d_obs * ca;
-          nearest_omni_py = d_obs * sa;
         }
 
         // Travel-direction gating by SWEPT CORRIDOR, not by bearing cone.
@@ -763,10 +737,10 @@ public:
         if (cfg_.filter_in_world) {
           double mx, my;
           sensorToWorld(raw_x, raw_y, mx, my);
-          kalman_.update(mx, my, fx, fy, &accepted, in_target);
+          kalman_.update(mx, my, dt, fx, fy, &accepted, in_target);
           worldToSensor(fx, fy, target_x_, target_y_);
         } else {
-          kalman_.update(raw_x, raw_y, fx, fy, &accepted, in_target);
+          kalman_.update(raw_x, raw_y, dt, fx, fy, &accepted, in_target);
           target_x_ = fx;
           target_y_ = fy;
         }
@@ -780,7 +754,6 @@ public:
 
     if (measurement_ok) {
       lost_frames_ = 0;
-      last_obs_time_ = std::chrono::steady_clock::now();
     } else {
       ++lost_frames_;
       if (lost_frames_ > cfg_.lost_frames_timeout) {
@@ -788,12 +761,10 @@ public:
         res.target_valid = false;
         return res;
       }
-      if (cfg_.enable_kalman) {
-        double dt_lost = std::chrono::duration<double>(
-          std::chrono::steady_clock::now() - last_obs_time_).count();
-        dt_lost = std::clamp(dt_lost, 0.02, 0.5);
+      if (cfg_.enable_kalman && in_target == 0) {
         double fx, fy;
-        kalman_.predictOnly(dt_lost, fx, fy);
+        // Gated corrections already predict; only an absent measurement predicts here.
+        kalman_.predictOnly(dt, fx, fy);
         if (cfg_.filter_in_world) {
           worldToSensor(fx, fy, target_x_, target_y_);
         } else {
@@ -1152,142 +1123,11 @@ public:
     }
     res.clearance_slow = scale < 1.0 ? scale : std::numeric_limits<double>::infinity();
 
-    // ---- nearest obstacle velocity, from its POSITION change between frames ----
-    //
-    // Not from the per-bin range change. A pedestrian crossing the view sweeps
-    // through bearings, so the bin it occupies changes every frame and the range
-    // difference at a fixed bin is meaningless (usually comparing against an
-    // empty bin). That is why the crossing-pedestrian scenario stayed flaky: the
-    // velocity feeding the escape and "let it pass" logic was noise, so neither
-    // rule could tell which way the pedestrian was going.
-    //
-    // The sensor frame translates with the robot, so the robot's own motion is
-    // removed using the measured odometry velocity.
-    if (std::isfinite(min_clearance_omni)) {
-      if (have_prev_nearest_ && dt > 1e-3) {
-        const double raw_vx = (nearest_omni_px - prev_nearest_px_) / dt;
-        const double raw_vy = (nearest_omni_py - prev_nearest_py_) / dt;
-        // a static obstacle appears to move at -(robot velocity) in this frame
-        nearest_omni_vx = raw_vx + odom_vx_;
-        nearest_omni_vy = raw_vy + odom_vy_;
-        // reject absurd values from a mismatch (the nearest return jumped to a
-        // different surface), and low-pass the rest
-        if (std::hypot(nearest_omni_vx, nearest_omni_vy) > 4.0) {
-          nearest_omni_vx = nearest_omni_vy = 0.0;
-          have_prev_nearest_ = false;
-        } else {
-          nearest_omni_vx = obs_vel_alpha_ * nearest_omni_vx +
-            (1.0 - obs_vel_alpha_) * filt_obs_vx_;
-          nearest_omni_vy = obs_vel_alpha_ * nearest_omni_vy +
-            (1.0 - obs_vel_alpha_) * filt_obs_vy_;
-        }
-      } else {
-        nearest_omni_vx = nearest_omni_vy = 0.0;
-      }
-      filt_obs_vx_ = nearest_omni_vx;
-      filt_obs_vy_ = nearest_omni_vy;
-      prev_nearest_px_ = nearest_omni_px;
-      prev_nearest_py_ = nearest_omni_py;
-      have_prev_nearest_ = true;
-    }    if (governor_.hardStop(d_stop)) {
+    if (governor_.hardStop(d_stop)) {
       res.emergency_stop = true;
       res.speed_limit = 0.0;
-      geometry_msgs::msg::Twist stop;
-
-      // ================= escape =================
-      //
-      // The body cannot advance along its intended path, but it must still be
-      // able to move, or the robot is simply dead: a 0.5 m step blocks a 0.36 m
-      // body, and the only way past is to back off and go around.
-      //
-      // Two candidate directions, in priority order:
-      //
-      //   1. VFH's most-free heading, when the planner reports a real gap and
-      //      that heading does not close on the nearest obstacle. This is what
-      //      gets the robot out of a dead end and lets it proceed along a
-      //      corridor: there, the gap IS the way forward.
-      //   2. Straight away from the nearest obstacle. Used when the freest
-      //      heading would drive back into whatever tripped the stop -- in open
-      //      ground VFH's freest heading can point through a crossing
-      //      pedestrian -- and in a true dead end where nothing recedes.
-      //
-      // Always at FULL speed: a pedestrian crossing at 0.40 m/s walks into a
-      // robot that recedes at only 0.25*0.9 = 0.22 m/s, so the gap kept
-      // shrinking to zero however early the stop fired.
-      //
-      // ================= choosing the escape heading =================
-      //
-      // Two cases, because the right response depends on whether the obstacle is
-      // coming to the robot or standing still.
-      //
-      // (a) The obstacle is MOVING toward the robot. Retreating along the line
-      //     of sight is wrong here: a pedestrian walking the same way the robot
-      //     backs off simply keeps pace, and the robot ends up fleeing down the
-      //     pedestrian's own path (measured: cmd.vy = -0.887 while the
-      //     pedestrian walked -y, closing to 0.001 m). The correct dodge is
-      //     PERPENDICULAR to the line of sight, to whichever side the obstacle
-      //     is not moving toward. That is a lateral step out of its way.
-      //
-      // (b) The obstacle is effectively static. Retreat along the line of sight,
-      //     but prefer the planner's most-open heading when it also recedes,
-      //     because that is what escapes a dead end: pressed into a trap,
-      //     "away from the wall" is sideways and the robot would slide along the
-      //     wall forever instead of heading for the opening.
-      const double ox = nearest_omni_px;
-      const double oy = nearest_omni_py;
-      const double rnorm = std::max(1e-3, std::hypot(ox, oy));
-      const double ux = ox / rnorm;             // unit vector robot -> obstacle
-      const double uy = oy / rnorm;
-      const double ovx = nearest_omni_vx;
-      const double ovy = nearest_omni_vy;
-
-      // component of the obstacle's velocity along the line of sight, toward us
-      const double approach = -(ovx * ux + ovy * uy);
-      const double away = wrapPi(nearest_omni_bearing + M_PI);
-      double out_dir = away;
-
-
-      if (approach > 0.10) {
-        // (a) An obstacle is coming toward the robot. Retreat along the line of
-        // sight, which increases the separation directly.
-        //
-        // Two cleverer rules were tried and both made things worse. "Step
-        // perpendicular to the obstacle's line of travel" ignored that the robot
-        // may already be past that line, and drove it back across the
-        // pedestrian's path (clearance -0.102 m). "Perpendicular to the line of
-        // sight, away from the obstacle's lateral drift" closed to 0.001 m in
-        // the same encounter. Retreating along the line of sight is the one
-        // direction guaranteed to increase separation from a given obstacle,
-        // which is exactly what the hard-stop floor needs. Keeping clear of a
-        // crossing obstacle's future path is the job of the speed governor
-        // above, which plans the approach; the escape only has to disengage.
-        out_dir = away;
-      } else if (cfg_.vfh.enable && res.vfh_traversable && res.vfh_best_free > 0.3) {
-        const double open_dir = res.vfh_best_dir;
-        const double closing_open = std::cos(open_dir) * ux + std::sin(open_dir) * uy;
-        if (closing_open <= -0.2 || !std::isfinite(min_clearance_omni)) {
-          out_dir = open_dir;
-        }
-      }
-      stop.linear.x = cfg_.max_linear * std::cos(out_dir);
-      stop.linear.y = cfg_.max_linear * std::sin(out_dir);
-      res.cmd = stop;
+      res.cmd = geometry_msgs::msg::Twist{};
       return res;
-    }
-    // Release the escape latch only when the PLANNER agrees a way through now
-    // exists, not merely because the instantaneous clearance crossed a
-    // threshold. Releasing on clearance alone produced a limit cycle: the robot
-    // would turn away, clearance would rise past the threshold, the latch would
-    // drop, VFH would re-select the blocked heading, and the robot would drive
-    // straight back into the hard stop (measured as 1.6 s EMERGENCY_STOP
-    // stretches in the pillar-detour scenario). VFH is the component that knows
-    // whether the gap is wide enough, so its verdict is what gates the release.
-    const bool planner_ok = !cfg_.vfh.enable ||
-      (res.vfh_traversable && res.vfh_free > cfg_.governor.d_hard);
-    if (!std::isfinite(d_stop) ||
-      (planner_ok && d_stop > (cfg_.governor.d_hard + cfg_.governor.release_hysteresis)))
-    {
-      escape_active_ = false;
     }
 
     // Continuous limit: slow down early instead of stopping late. Scaling the
@@ -1521,8 +1361,6 @@ private:
   SpeedGovernor governor_;
   VfhPlanner vfh_;
   double prev_dir_ = 0.0;
-  bool escape_active_ = false;
-  double escape_dir_ = 0.0;
   double behind_time_ = 0.0;
   std::vector<float> obs_ranges_;
   std::vector<float> prev_obs_ranges_;
@@ -1535,8 +1373,9 @@ private:
   int linear_dir_ = 0;
   int angular_dir_ = 0;
   double linear_integral_ = 0.0;
-  std::chrono::steady_clock::time_point last_obs_time_;
-  std::chrono::steady_clock::time_point last_control_time_;
+  bool have_scan_stamp_ = false;
+  bool require_rebind_ = false;
+  int64_t last_scan_stamp_ns_ = 0;
   // inertial-frame target filtering support
   double odom_vx_ = 0.0, odom_vy_ = 0.0, odom_wz_ = 0.0;
   double dead_x_ = 0.0, dead_y_ = 0.0, dead_yaw_ = 0.0;

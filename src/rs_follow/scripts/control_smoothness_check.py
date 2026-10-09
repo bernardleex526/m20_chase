@@ -82,11 +82,13 @@ class Probe(Node):
         with self.lock:
             gen = self.gen
         if gen is not None:
-            self.pub.publish(make_cloud(gen(), self.get_clock().now().to_msg()))
+            self.cloud_stamp = self.get_clock().now().to_msg()
+            self.pub.publish(make_cloud(gen(), self.cloud_stamp))
 
     def bind(self, x, y):
         p = PointStamped()
         p.header.frame_id = 'rslidar'
+        p.header.stamp = getattr(self, 'cloud_stamp', self.get_clock().now().to_msg())
         p.point.x, p.point.y, p.point.z = float(x), float(y), 0.0
         self.bind_pub.publish(p)
 
@@ -129,6 +131,9 @@ def std(xs):
 def run_pass(kalman):
     node_cmd = ['ros2', 'run', 'rs_follow', 'rs_follow_node']
     params = ['-p', f'input_topic:={TEST_TOPIC}', '-p', 'active:=true',
+              '-p', 'control_frame:=rslidar',
+              '-p', 'height_min:=-0.4', '-p', 'height_max:=1.8',
+              '-p', 'enable_low_band:=false',
               '-p', f'enable_kalman:={str(kalman).lower()}',
               '-p', 'lost_frames_timeout:=5',
               '-p', 'max_linear_accel:=0.8',

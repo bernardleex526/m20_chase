@@ -1,0 +1,49 @@
+# Synthetic cloud/body coordinates ONLY; not a calibration for any real robot.
+# M20 requires a separately started fake_m20_server on 127.0.0.1:30000.
+# Twist output and Unitree requests must go only to test subscribers, never hardware.
+deployment:
+  nonhardware: true
+  tf_source: loopback_identity
+rs_follow_node:
+  ros__parameters:
+    input_topic: /rslidar_points
+    control_frame: rslidar
+    odom_topic: /m20/odom
+    robot_length: 0.62
+    robot_width: 0.36
+    auto_frame: false
+    frame_front: 0.31
+    frame_back: 0.31
+    frame_left: 0.18
+    frame_right: 0.18
+    height_min: 0.35
+    height_max: 2.55
+    enable_low_band: false
+    low_height_min: 0.10
+    low_height_max: 0.30
+    active: false
+    auto_select_front: false
+    search_enable: false
+    recovery_enable: false
+    compensate_slip: false
+m20_bridge:
+  ros__parameters:
+    transport: udp
+    ip: 127.0.0.1
+    port: 30000
+    odom_topic: /m20/odom
+    auto_setup: false
+    status_timeout: 1.5
+twist_adapter:
+  ros__parameters:
+    output_topic: /loopback/controller_cmd_vel
+    lateral: false
+    base_frame: rslidar
+unitree_adapter:
+  ros__parameters:
+    request_topic: /loopback/sport/request
+web_ui:
+  ros__parameters:
+    bind_host: 127.0.0.1
+    http_port: 8080
+    ws_port: 8890

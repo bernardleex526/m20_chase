@@ -35,6 +35,9 @@ struct Obs {double range; double bearing_deg; bool low_band;};
 ScanFrame makeScan(const std::vector<Obs> & obs, int bins = 1440)
 {
   ScanFrame s;
+  static int64_t stamp_ns = 1000000000LL;
+  stamp_ns += 100000000LL;
+  s.stamp = rclcpp::Time(stamp_ns, RCL_ROS_TIME);
   s.angle_min = -M_PI;
   s.angle_increment = (2.0 * M_PI) / bins;
   s.ranges.assign(static_cast<size_t>(bins), std::numeric_limits<float>::infinity());
@@ -72,6 +75,9 @@ FollowConfig baseConfig()
   c.governor.enable = true;
   c.vfh.enable = true;
   c.vfh.auto_d_safe = true;
+  c.enable_kalman = false;
+  c.filter_in_world = false;
+  c.k_integral = 0.0;
   return c;
 }
 
@@ -229,6 +235,33 @@ int main()
     check(!r.emergency_stop, "person at 0.55 m does not trigger a hard stop");
     check(r.min_obstacle_dist > 0.5 || !std::isfinite(r.min_obstacle_dist),
           "person contributes no obstacle closer than 0.5 m");
+  }
+
+  // 7. A hard stop overrides every component of the nominal command, including
+  //    lateral escape and yaw. Keep steering fixed so the collision course is
+  //    deterministic rather than allowing VFH to select a different path.
+  {
+    std::printf("\n7. hard stop produces a six-component zero command\n");
+    FollowConfig c = baseConfig();
+    c.vfh.enable = false;
+    FollowController fc(c);
+    ScanFrame s = makeScan({{3.0, 0.0, false}, {0.45, 0.0, true}});
+    check(fc.bindTarget(3.0, 0.0, s), "target at (3, 0) binds successfully");
+    for (int i = 0; i < 3; ++i) {
+      s.stamp = rclcpp::Time(s.stamp.nanoseconds() + 10000000LL, RCL_ROS_TIME);
+      const FollowResult r = fc.update(s);
+      check(r.emergency_stop, "low obstacle at (0.45, 0) triggers hard stop");
+      check(r.cmd.linear.x == 0.0 && r.cmd.linear.y == 0.0 &&
+        r.cmd.linear.z == 0.0 && r.cmd.angular.x == 0.0 &&
+        r.cmd.angular.y == 0.0 && r.cmd.angular.z == 0.0,
+        "triggered hard stop zeros all six Twist components");
+      check(r.speed_limit == 0.0, "hard-stop speed limit is zero");
+      check(r.target_valid && r.target_observed,
+        "hard stop retains the accepted actual target observation");
+    }
+    const FollowResult clear = fc.update(makeScan({{3.0, 0.0, false}}));
+    check(!clear.emergency_stop && clear.cmd.linear.x > 0.0,
+      "normal following resumes once the hard-stop obstacle is absent");
   }
 
   std::printf("\n=== %s (%d failure%s) ===\n",

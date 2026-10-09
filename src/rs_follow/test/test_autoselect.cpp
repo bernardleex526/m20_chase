@@ -68,6 +68,9 @@ void addPerson(ScanFrame & s, double x, double y, double rad)
 ScanFrame blank(int bins = 1440)
 {
   ScanFrame s;
+  static int64_t stamp_ns = 1000000000LL;
+  stamp_ns += 100000000LL;
+  s.stamp = rclcpp::Time(stamp_ns, RCL_ROS_TIME);
   s.angle_min = -M_PI;
   s.angle_increment = (2.0 * M_PI) / bins;
   s.ranges.assign(static_cast<size_t>(bins), std::numeric_limits<float>::infinity());
@@ -84,6 +87,9 @@ FollowConfig cfgBase()
   c.auto_select_max_range = 8.0;
   c.auto_max_target_width = 0.90;
   c.follow_dist = 1.0;
+  c.enable_kalman = false;
+  c.filter_in_world = false;
+  c.k_integral = 0.0;
   return c;
 }
 
@@ -102,6 +108,7 @@ int main()
     addSurface(s, -60.0, 60.0, 1.5);
     FollowResult r = fc.update(s);
     check(!r.target_valid, "no target selected from a wall");
+    check(!r.target_observed, "rejected wall is not an observed target");
   }
 
   // 1b. The robot's OWN body must never be selected. Its top surface sits in the
@@ -139,6 +146,7 @@ int main()
     addPerson(s, 3.0, 0.0, 0.25);
     FollowResult r = fc.update(s);
     check(r.target_valid, "person selected");
+    check(r.target_observed, "accepted person cluster is actually observed");
     const double rng = std::hypot(fc.targetX(), fc.targetY());
     char buf[128];
     std::snprintf(buf, sizeof(buf), "selected at %.2f m (person at 2.75)", rng);
@@ -213,6 +221,88 @@ int main()
                   "selected at %d/%d bearings in 0..40 deg at 1.20 m",
                   ok_count, n);
     check(ok_count == n, buf);
+  }
+
+  // 6. A binding failure is transactional, including when an automatic target
+  //    was already selected. Only a real target-band return can be bound.
+  {
+    std::printf("\n6. failed binding preserves the existing target\n");
+    FollowController fc(cfgBase());
+    ScanFrame person = blank();
+    addPerson(person, 3.0, 0.0, 0.25);
+    const FollowResult acquired = fc.update(person);
+    check(acquired.target_valid && acquired.target_observed,
+      "automatic target acquired before rebinding");
+    const double old_x = fc.targetX(), old_y = fc.targetY();
+    const auto unchanged = [&]() {
+        return fc.targetValid() && !fc.targetManual() &&
+               fc.targetX() == old_x && fc.targetY() == old_y;
+      };
+    check(!fc.bindTarget(6.0, 0.0, person) && unchanged(),
+      "click without a nearby return preserves automatic target");
+    check(!fc.bindTarget(std::numeric_limits<double>::quiet_NaN(), 0.0, person) &&
+      unchanged(), "nonfinite click preserves automatic target");
+    ScanFrame low_only = blank();
+    low_only.low_ranges[720] = 3.0f;
+    check(!fc.bindTarget(3.0, 0.0, low_only) && unchanged(),
+      "low-band-only return cannot bind or replace target");
+    ScanFrame chassis = blank();
+    chassis.ranges[720] = 0.1f;
+    check(!fc.bindTarget(0.1, 0.0, chassis) && unchanged(),
+      "self-occluded return cannot bind or replace target");
+    ScanFrame invalid = blank();
+    invalid.ranges[720] = -3.0f;
+    check(!fc.bindTarget(-3.0, 0.0, invalid) && unchanged(),
+      "negative range cannot bind or replace target");
+    check(fc.bindTarget(3.0, 0.0, person) && fc.targetManual(),
+      "nearby target-band return successfully commits manual target");
+    const double manual_x = fc.targetX(), manual_y = fc.targetY();
+    check(!fc.bindTarget(6.0, 0.0, blank()) && fc.targetValid() &&
+      fc.targetManual() && fc.targetX() == manual_x && fc.targetY() == manual_y,
+      "failed rebind preserves the previous manual target");
+    FollowController empty(cfgBase());
+    check(!empty.bindTarget(3.0, 0.0, blank()) && !empty.targetValid(),
+      "failed initial binding does not invent a target");
+  }
+
+  // 7. Coasting may retain a valid target but is never a fresh observation.
+  {
+    std::printf("\n7. target observation distinguishes tracking from coasting\n");
+    FollowConfig c = cfgBase();
+    c.auto_select_front = false;
+    c.lost_frames_timeout = 1;
+    FollowController fc(c);
+    ScanFrame person = blank();
+    addPerson(person, 3.0, 0.0, 0.25);
+    check(fc.bindTarget(3.0, 0.0, person), "manual target binds to actual return");
+    const FollowResult observed = fc.update(person);
+    check(observed.target_valid && observed.target_observed,
+      "actual accepted cluster reports target_observed");
+    const FollowResult coast = fc.update(blank());
+    check(coast.target_valid && !coast.target_observed && coast.points_in_target == 0,
+      "coasting retains target without claiming observation");
+    const FollowResult lost = fc.update(blank());
+    check(!lost.target_valid && !lost.target_observed,
+      "expired target is neither valid nor observed");
+  }
+
+  // 8. Points in the cluster are not an observation if the filter rejects them.
+  {
+    std::printf("\n8. rejected cluster is not reported as observed\n");
+    FollowConfig c = cfgBase();
+    c.auto_select_front = false;
+    c.enable_kalman = true;
+    c.kalman_gate = 0.001;
+    FollowController fc(c);
+    ScanFrame initial = blank();
+    initial.ranges[720] = 3.0f;
+    check(fc.bindTarget(3.0, 0.0, initial), "filter initialized from bound return");
+    ScanFrame outlier = blank();
+    outlier.ranges[720] = 3.4f;
+    const FollowResult rejected = fc.update(outlier);
+    check(rejected.points_in_target > 0, "outlier still lies in target cluster window");
+    check(rejected.target_valid && !rejected.target_observed,
+      "filter-rejected cluster retains target without reporting observation");
   }
 
   std::printf("\n=== %s (%d failure%s) ===\n",

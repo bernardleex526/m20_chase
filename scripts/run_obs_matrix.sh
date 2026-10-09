@@ -22,6 +22,7 @@ trap cleanup EXIT
 echo "=== start rs_follow_node (Gazebo NOT started) ==="
 ros2 run rs_follow rs_follow_node --ros-args \
   -p input_topic:=/rslidar_points \
+  -p control_frame:=rslidar -p enable_low_band:=false \
   -p active:=false \
   -p odom_topic:=/no_odom \
   -p compensate_slip:=false \

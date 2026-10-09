@@ -193,6 +193,7 @@ class Sim(Node):
             self.t0 = time.time()
             return
         t = time.time() - self.t0
+        stamp = self.get_clock().now().to_msg()
 
         vx, vy, wz = self.cmd
         ax, ay = vx * self.slip, vy * self.slip   # actual motion (slip != command)
@@ -202,7 +203,7 @@ class Sim(Node):
 
         # publish odometry of the ACTUAL motion (what a real robot's odom gives)
         od = Odometry()
-        od.header.stamp = self.get_clock().now().to_msg()
+        od.header.stamp = stamp
         od.header.frame_id = 'odom'
         od.child_frame_id = 'base_link'
         od.pose.pose.position.x = self.rx
@@ -228,11 +229,12 @@ class Sim(Node):
             rox, roy = world_to_robot(self.rx + 0.30, self.ry, self.rx, self.ry, self.ryaw)
             pts += bar_cloud(rox, roy)
 
-        self.pub.publish(make_cloud(pts, self.get_clock().now().to_msg()))
+        self.pub.publish(make_cloud(pts, stamp))
 
         if 0.2 < t < 0.4 and not self.bound and rtx is not None:
             p = PointStamped()
             p.header.frame_id = 'rslidar'
+            p.header.stamp = stamp
             p.point.x, p.point.y, p.point.z = rtx, rty, 0.0
             self.bind_pub.publish(p)
             self.bound = True
@@ -269,6 +271,9 @@ def stop_proc(proc):
 
 def start_node():
     params = ['-p', f'input_topic:={SIM_TOPIC}', '-p', 'active:=true',
+              '-p', 'control_frame:=rslidar',
+              '-p', 'height_min:=-0.4', '-p', 'height_max:=1.8',
+              '-p', 'enable_low_band:=false',
               '-p', 'enable_kalman:=true', '-p', 'auto_select_front:=true',
               '-p', 'follow_dist:=1.0', '-p', 'max_linear:=0.9', '-p', 'max_angular:=1.0',
               '-p', 'k_linear:=2.5', '-p', 'k_angular:=1.5', '-p', 'max_linear_cmd:=1.5',

@@ -236,10 +236,11 @@ class PySim(Node):
         tw = self.target_world(t)
         self.world.cylinders = [(tw[0], tw[1], TARGET_R, 1.7)]
         pts_sensor = raycast(origin, R_ws, self.V_s, self.world, self.cfg, self.rng)
-        self.cloud_pub.publish(self._make_cloud(pts_sensor))
+        stamp = self.get_clock().now().to_msg()
+        self.cloud_pub.publish(self._make_cloud(pts_sensor, stamp))
 
         od = Odometry()
-        od.header.stamp = self.get_clock().now().to_msg()
+        od.header.stamp = stamp
         od.header.frame_id = 'odom'
         od.child_frame_id = 'base_link'
         od.pose.pose.position.x = self.rx + self.rng.normal(0, 0.005)
@@ -256,6 +257,7 @@ class PySim(Node):
             rtx, rty = self._to_sensor(tw[0], tw[1], R_ws, origin)
             p = PointStamped()
             p.header.frame_id = 'rslidar'
+            p.header.stamp = stamp
             p.point.x, p.point.y, p.point.z = rtx, rty, 0.0
             self.bind_pub.publish(p)
             self.bound = True
@@ -275,9 +277,9 @@ class PySim(Node):
         s = R_ws.T @ d
         return s[0], s[1]
 
-    def _make_cloud(self, pts):
+    def _make_cloud(self, pts, stamp):
         msg = PointCloud2()
-        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.stamp = stamp
         msg.header.frame_id = 'rslidar'
         msg.height = 1
         msg.width = len(pts)
@@ -316,6 +318,9 @@ def stop_proc(proc):
 
 def start_node():
     params = ['-p', f'input_topic:={SIM_TOPIC}', '-p', 'active:=true',
+              '-p', 'control_frame:=rslidar',
+              '-p', 'height_min:=-0.4', '-p', 'height_max:=1.8',
+              '-p', 'enable_low_band:=false',
               '-p', 'odom_topic:=/odom', '-p', 'enable_kalman:=true',
               '-p', 'filter_in_world:=true', '-p', 'auto_select_front:=true',
               '-p', 'follow_dist:=1.0', '-p', 'max_linear:=0.9', '-p', 'max_angular:=1.0',

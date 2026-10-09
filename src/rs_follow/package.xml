@@ -15,6 +15,13 @@
   <depend>nav_msgs</depend>
   <depend>visualization_msgs</depend>
   <depend>std_msgs</depend>
+  <depend>rs_follow_interfaces</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>python3-websockets</exec_depend>
+
+  <test_depend>ament_cmake_test</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

@@ -11,7 +11,6 @@
 
 #include <array>
 #include <cmath>
-#include <chrono>
 
 namespace rs_follow
 {
@@ -43,27 +42,19 @@ public:
     P_[15] = 10.0;
   }
 
-  void update(double meas_x, double meas_y, double & fx, double & fy,
+  void update(double meas_x, double meas_y, double dt, double & fx, double & fy,
               bool * accepted = nullptr, int n_points = 0)
   {
-    auto now = std::chrono::steady_clock::now();
     if (!initialized_) {
       x_[0] = meas_x;
       x_[1] = meas_y;
       x_[2] = 0.0;
       x_[3] = 0.0;
-      last_time_ = now;
       initialized_ = true;
       fx = meas_x;
       fy = meas_y;
       if (accepted) {*accepted = true;}
       return;
-    }
-
-    double dt = std::chrono::duration<double>(now - last_time_).count();
-    last_time_ = now;
-    if (dt <= 0.0 || dt > 1.0) {
-      dt = 0.1;
     }
 
     predict(dt);
@@ -97,7 +88,6 @@ public:
     P_[10] = 10.0;
     P_[15] = 10.0;
     initialized_ = true;
-    last_time_ = std::chrono::steady_clock::now();
   }
 
   bool isInitialized() const { return initialized_; }
@@ -229,7 +219,6 @@ private:
   bool initialized_ = false;
   std::array<double, 4> x_;
   std::array<double, 16> P_;
-  std::chrono::steady_clock::time_point last_time_;
 };
 
 }  // namespace rs_follow

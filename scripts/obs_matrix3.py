@@ -138,6 +138,7 @@ class Matrix(Node):
         p.header.frame_id = "rslidar"
         p.point.x, p.point.y = target_xy
         for _ in range(4):
+            p.header.stamp = self.get_clock().now().to_msg()
             self.bind.publish(p)
             self.pump(0.06, target_xy, obstacles)
         self.en.publish(Bool(data=True))

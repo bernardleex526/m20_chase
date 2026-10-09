@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>dog_adapters</name>
+  <version>0.1.0</version>
+  <description>Shared command safety gate and Twist/Unitree robot adapters.</description>
+  <maintainer email="jetson@example.com">jetson</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>rs_follow</exec_depend>
+  <!-- m20_bridge is optional and checked by follow_stack at launch; no reverse dependency. -->
+  <!-- unitree_api is optional: only the Unitree executable imports it. -->
+  <test_depend>python3-pytest</test_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

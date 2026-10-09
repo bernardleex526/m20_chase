@@ -7,4 +7,4 @@ rs_follow_sim/
 rs_follow_pysim/
 src/rs_follow/docs/SLAM_FASTLIO2_PLAN.md
 evidence/
-gazebo/
+/gazebo/

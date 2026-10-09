@@ -82,6 +82,7 @@ class Harness(Node):
         self.pub = self.create_publisher(PointCloud2, TEST_TOPIC, qos_profile_sensor_data)
         self.bind_pub = self.create_publisher(PointStamped, '/clicked_point', 10)
         self.clear_pub = self.create_publisher(Bool, '/rs_follow/clear_target', 10)
+        self.enable_pub = self.create_publisher(Bool, '/rs_follow/enable', 10)
         self.cmds = []
         self.status = 'INIT'
         self.lock = threading.Lock()
@@ -92,7 +93,8 @@ class Harness(Node):
 
     def _on_cmd(self, msg):
         with self.lock:
-            self.cmds.append((msg.linear.x, msg.linear.y, msg.angular.z))
+            self.cmds.append((msg.linear.x, msg.linear.y, msg.angular.z,
+                              msg.linear.z, msg.angular.x, msg.angular.y))
 
     def _on_status(self, msg):
         with self.lock:
@@ -102,7 +104,8 @@ class Harness(Node):
         with self.lock:
             pts = self.current
         if pts is not None:
-            self.pub.publish(make_cloud(pts, self.get_clock().now().to_msg()))
+            self.cloud_stamp = self.get_clock().now().to_msg()
+            self.pub.publish(make_cloud(pts, self.cloud_stamp))
 
     def set_points(self, pts):
         with self.lock:
@@ -113,10 +116,15 @@ class Harness(Node):
         m.data = True
         self.clear_pub.publish(m)
 
+    def enable(self):
+        m = Bool()
+        m.data = True
+        self.enable_pub.publish(m)
+
     def bind(self, x, y):
         p = PointStamped()
         p.header.frame_id = 'rslidar'
-        p.header.stamp = self.get_clock().now().to_msg()
+        p.header.stamp = getattr(self, 'cloud_stamp', self.get_clock().now().to_msg())
         p.point.x, p.point.y, p.point.z = float(x), float(y), 0.0
         self.bind_pub.publish(p)
 
@@ -149,13 +157,15 @@ def stop_proc(proc):
 
 def run_scenario(h, name, points, bind=None, duration=1.5, settle=0.5, expect=None,
                  wait_status=None, ramp=0.8):
-    h.clear()
-    time.sleep(0.3)
     h.set_points(points)
     time.sleep(settle)
+    h.clear()
+    time.sleep(0.3)
     if bind is not None:
         h.bind(*bind)
         time.sleep(0.4)
+    # Clearing now deliberately pauses; each independent scenario explicitly starts.
+    h.enable()
 
     if wait_status is not None:
         deadline = time.time() + 4.0
@@ -180,6 +190,10 @@ def run_scenario(h, name, points, bind=None, duration=1.5, settle=0.5, expect=No
     ok, why = (True, '')
     if expect is not None:
         ok, why = expect(status, vx, vy, wz)
+    if name == 'emergency_obstacle':
+        # Check every measured Twist component, not averages that can cancel.
+        ok = ok and bool(cmds) and all(abs(v) < 1e-6 for cmd in cmds for v in cmd)
+        why = 'EMERGENCY_STOP, all six cmd components=0'
     return {
         'name': name, 'status': status, 'n': len(cmds),
         'vx': vx, 'vy': vy, 'wz': wz, 'pass': ok, 'why': why,
@@ -206,11 +220,17 @@ def build_scenarios():
     # 6) target behind -> rotate in place, no forward motion
     S.append(('behind', cluster(-1.5, 0.0), (-1.5, 0.0), None,
               lambda s, vx, vy, wz: (abs(vx) < 0.06 and abs(wz) > 0.1, 'vx~0, |wz|>0')))
-    # 7) close obstacle in front -> emergency stop
-    obs = cluster(2.0, 0.0, n=40) + cluster(0.30, 0.0, n=20, spread=0.03)
+    # 7) external low obstacle, 0.06 m beyond the explicit 0.39 m front edge.
+    # Its low-only band cannot hide the target on the same ray or be selected
+    # as a target. The physical clearance trips the omnidirectional emergency
+    # floor even when VFH chooses an avoidance heading; no planner bypass.
+    obs = (cluster(2.0, 0.0, n=40) +
+           cluster(0.45, 0.0, n=20, spread=0.03, zmin=-0.6, zmax=-0.5) +
+           [(0.45, 0.0, -0.55)])
     S.append(('emergency_obstacle', obs, (2.0, 0.0), None,
               lambda s, vx, vy, wz: (s == 'EMERGENCY_STOP' and
-                                     abs(vx) < 1e-6 and abs(wz) < 1e-6, 'EMERGENCY_STOP, cmd=0')))
+                                     abs(vx) < 1e-6 and abs(vy) < 1e-6 and
+                                     abs(wz) < 1e-6, 'EMERGENCY_STOP, cmd=0')))
     # 8) left wall between robot and target -> lateral shift away from wall
     corr = cluster(2.0, 0.0) + wall(0.9, 1.4, 0.2)
     S.append(('corridor_left_wall', corr, (2.0, 0.0), None,
@@ -251,6 +271,14 @@ def main():
 
     params = [
         '-p', f'input_topic:={TEST_TOPIC}',
+        '-p', 'control_frame:=rslidar',
+        '-p', 'height_min:=-0.4', '-p', 'height_max:=1.8',
+        # Disjoint synthetic low band leaves all existing target clouds intact.
+        '-p', 'enable_low_band:=true',
+        '-p', 'low_height_min:=-0.6', '-p', 'low_height_max:=-0.5',
+        '-p', 'auto_frame:=false', '-p', 'frame_front:=0.39',
+        '-p', 'frame_back:=0.45',
+        '-p', 'frame_left:=0.25', '-p', 'frame_right:=0.25',
         '-p', 'active:=true',
         '-p', 'enable_kalman:=false',
         '-p', 'lost_frames_timeout:=5',

@@ -7,13 +7,15 @@
 
 ---
 
+最终软件验证：四包构建通过、colcon 211 项零错误/失败/跳过、pytest 231 项通过且无跳过、坐标 DDS 验收 8/8、消费者场景 13/13 PASS（含六分量硬停止）、五个 C++ 测试通过；governor 仅为退出 0 的诊断。完整 `follow_acceptance --case all` 7/7 PASS、退出 0，包含 crossing 与 clock_pause。证据与边界见 [最终 step5 报告](../../../.omp/reports/step5.md)；这些是此次清理前的软件证据。本文既有 WSL 性能/传感器高度数据是历史测量，不能替代 Jetson 或机器人实测。硬件 TF 与高度带未实测，保持 `active=false`；几何跟随适用于平地、低速、受控场景，不保证身份。
+
 ## 0. 结论速览
 
 | 问题 | 结论 | 依据 |
 |---|---|---|
 | rs_follow 能否跑在 Jetson NX 16GB 上？ | **可以，CPU 余量极大** | 实测 131072 点 @10 Hz 时 **3.0 % 单核**、RSS **28 MB**（第 2 节） |
 | 有没有 x86 专属代码需要重写？ | **没有，一行都不用改** | 全仓库无 SIMD/intrinsic/绝对路径（第 3.1 节） |
-| 是否依赖 PCL / OpenCV / Eigen / CUDA？ | **全部不依赖** | 只依赖 6 个 ROS 消息包 + C++ 标准库（第 3.2 节） |
+| 是否依赖 PCL / OpenCV / Eigen / CUDA？ | 投影与 TF 变换不需要 PCL / OpenCV / CUDA | 当前增加 tf2/tf2_ros 与绑定接口依赖，见第 3.2 节 |
 | 会不会被 JetPack 版本卡住？ | **Xavier NX 会被卡住，Orin NX 不会**（关键差异，第 1 节） | Xavier NX 最高 JetPack 5.1.7 = Ubuntu 20.04；Humble 官方 deb 只发 22.04 |
 | 能否统一适配所有机器狗？ | **架构可行**，接口是标准 `/cmd_vel`（Twist） | 第 4 节三段式分层 |
 | 通用化的真实瓶颈在哪？ | **不在算法，在传感器外参 + 各厂商 SDK 的私有协议** | 第 4.3、5 节 |
@@ -103,15 +105,13 @@ sudo apt update && sudo apt install -y ros-humble-ros-base ros-dev-tools
 
 ### 3.2 依赖极简（这是它能在 Jetson 上轻松跑起来的根本原因）
 
-`src/rs_follow/CMakeLists.txt`（**main 与 algo-only 逐字节相同**，已用 `git diff` 核验）声明的依赖只有 6 个**纯消息/客户端包**：
+历史 WSL 被测版本的 `src/rs_follow/CMakeLists.txt` 声明如下；这是历史依赖快照，当前坐标迁移还使用 `tf2`、`tf2_ros` 和 `rs_follow_interfaces`，应以当前清单为准：
 
 ```cmake
 ament_cmake rclcpp sensor_msgs geometry_msgs nav_msgs visualization_msgs std_msgs
 ```
 
-实际 `#include` 出来的全部头文件是：`<algorithm> <array> <chrono> <cmath> <limits> <memory> <string> <vector>`（C++ 标准库）+ rclcpp、geometry_msgs（Twist/PointStamped）、sensor_msgs（PointCloud2/LaserScan/PointCloud2Iterator）、nav_msgs（Odometry）、std_msgs（Bool/Int32/String）、visualization_msgs（Marker）。
-
-**没有 PCL。没有 OpenCV。没有 Eigen。没有 CUDA。没有 Boost。** 编译产出一个单文件可执行 `rs_follow_node`（`add_executable(rs_follow_node src/rs_follow_node.cpp)`）。
+上述头文件与单文件可执行产出描述属于历史版本。当前节点通过 tf2 查询刚体变换，投影直接处理 XYZ，无需 PCL 点云转换，也不引入 OpenCV/CUDA。
 
 > 这一点**极其关键**：PCL 和 OpenCV 在 Jetson 上是最大的依赖痛点（版本冲突、编译数小时、与 JetPack 自带的 OpenCV 打架）。本仓库天然绕开了这两个坑。**这是它作为一个「可上车」项目的最大优势之一。**
 
@@ -158,39 +158,29 @@ C++17 在 JetPack 5（GCC 9.4）和 JetPack 6（GCC 11.4）上都原生支持。
 
 | 类型 | 代表机器人 | 适配做法 | 工作量 |
 |---|---|---|---|
-| **A. 原生接受 `/cmd_vel`（Twist）** | 智元 D1 / jie_deamon、SW01（作者另一仓库）、绝大多数通用 ROS 底盘 | **零桥接**，只改 `cmd_vel_topic` 参数 | 分钟级 |
-| **B. 私有 SDK / 私有协议** | **DeepRobotics M20**、部分宇树型号 | 写一个 Twist→私有协议的桥接节点 | 1–3 天 |
-| **C. ROS 2 有官方包但消息类型非 Twist** | **Unitree Go2 / B2**（`unitree_api/msg/Request` Sport Mode 或 `unitree_go`） | 写 Twist→Unitree API 的桥接 | 0.5–1 天 |
+| **A. 原生 Twist / TwistStamped** | 具有标准 ROS 2 速度控制入口的底盘 | 现有 `dog_adapters twist_adapter`；显式填写 output_topic/stamped | 配置及现场确认 |
+| **B. 私有 SDK / 私有协议** | **DeepRobotics M20**、其他私有接口 | M20 已有 `m20_bridge`；其他协议仍需实现桥接 | 按接口评估 |
+| **C. 官方非 Twist 消息** | 支持官方 Unitree Sport API 的型号 | 现有 `dog_adapters unitree_adapter`；必须 source 官方 unitree_api | 依赖、权限及现场确认 |
 
-**关于 M20（本仓库的 main 分支已经给出了一个现成范例）**：`src/m20_bridge/` 就是一个**完整的 B 类桥接实现**，可以直接当作「怎么写新桥接」的模板：
+当前可用 `dog_adapters follow_stack.launch.py` 显式选择 `adapter:=m20/twist/unitree_sport`，必须提供 `robot_config` YAML，默认 inactive，仅启动一个输出适配器；可选 `with_web:=true`。命令、配置契约、arm 服务和可选依赖见[根 README](../../../README.md)。step5 真实 launch 的三种输出及 Web 启动无硬件 smoke 已通过。AIR/PRO/EDU 的 SDK/Sport API/DDS 权限必须按型号、固件和授权核实，不能据此表宣称所有型号兼容；软件 DDS 与 M20 本地 UDP/TCP 证据不证明 Jetson 部署或硬件验证。
 
-- **协议**（`m20_bridge/protocol.py`，64 行）：16 字节 APDU 头 + JSON ASDU。`SYNC = bytes([0xEB,0x91,0xEB,0x90])`，`FMT_JSON=0x01`；头部 = `SYNC + struct.pack('<H', len(body)) + struct.pack('<H', msg_id & 0xFFFF) + bytes([FMT_JSON]) + bytes(7)`。
-- **指令**：`heartbeat()=encode(100,100)`、`set_mode(m)=encode(1101,5,{"Mode":m})`、`set_motion_state(p)=encode(2,22,{"MotionParam":p})`、`set_gait(g)=encode(2,23,{"GaitParam":g})`、`axis_cmd(x,y,yaw,...)=encode(2,21,{"X":...,"Y":...,"Z":...,"Roll":...,"Pitch":...,"Yaw":...})`。
-- **桥接节点**（`bridge_node.py`，220 行）的**关键设计点，值得每个新桥接抄**：
-  - **量纲归一化**：M20 的轴指令是 `[-1,1]` 的**最大速度比例**，不是 m/s。所以桥接里有 `full_scale_x/full_scale_y/full_scale_yaw`（默认 2.0 / 1.0 / 1.5），做 `x = clamp(vx/full_scale_x)`。**这就是「通用化」必须处理的第一件事：把算法输出的物理量纲，映射到目标平台的抽象量纲。**
-  - **看门狗**（安全关键）：`stale = (time.time()-self.last_cmd_t) > self.watchdog_timeout`，默认 0.5 s；一旦超时就发全 0。**这是任何桥接都必须有的**——因为算法节点崩溃或网络断了，机器人必须停。
-  - **状态门控**：`safe = stale or self.hes or (self.mode_now not in (-1,0))`——机器人不在「常规模式」时不接受速度指令。
-  - **状态回传**：订阅 Type1002/Command6（`BasicStatus.HES/ControlUsageMode/MotionState/Gait`）与 Type1002/Command4（`MotionStatus.Yaw/LinearX/LinearY/OmegaZ`），积分成 `nav_msgs/Odometry` 发布到 `/m20/odom`。**注意**：算法需要 `/odom`（`follow_params.yaml` 的 `odom_topic=/odom`）来实现 `compensate_slip`（滑移补偿）和 `filter_in_world`（世界系滤波）。很多厂商 SDK 不直接给 odom，需要自己从轴反馈积分——M20 桥接的做法就是范例。
+**M20 当前实现要点**（详细参数见[M20 README](../../m20_bridge/README.md)）：
 
-> **通用化的真正难点，在 `full_scale` 的标定**：M20 的 README 明确给了标定法——「卷尺测实际速度 v，`full_scale_x = v / 轴值`」。**每一个新机器人上车，第一件事都是标定这三个数**，否则跟随的稳态误差会直接体现为「站得太近/太远」。`REPORT.md` §2.3/§2.4 实测到的 **4.9 cm（静态）/ 5.7 cm（移动）** 稳态站位误差里，就包含这类标定误差与仿真底盘建模误差。
+- **协议**：严格 16 字节 APDU 头 + JSON ASDU；TCP 支持分片/合并，非法 magic/fmt/JSON、EOF 或传输错误取消接收并清除就绪和旧指令，不自动重连；UDP 只接受配置服务器来源。
+- **量纲归一化**：`[-1,1]` 轴值是速度比例，不是 m/s；`full_scale_x/y/yaw` 默认 2.0 / 1.0 / 1.5 **仅作回环测试假设**，实机必须确认/标定并显式设置。固定 vx/vy/wz 限幅 0.3 / 0.15 / 0.5 不能代替比例标定。
+- **看门狗和状态**：指令 `watchdog_timeout` 默认 0.3s，状态 `status_timeout` 默认 1.5s，均须有限且大于零；采用单调时钟。只在新鲜 BasicStatus 明确 `HES=0`、`ControlUsageMode=0` 时接受运动，MotionStatus 也按 `status_timeout` 过滤。未知/失联/陈旧状态、非有限速度或急停清除旧指令；恢复须新指令。软件零轴不是物理停机保证。
+- **保守配置**：默认 `auto_setup=false`；自动配置需显式确认 `setup_enums_confirmed=true`、`mode=0`、实际 motion_state/gait 枚举。站起/趴下还需显式 stand_motion_state/lie_motion_state，均默认 -1；不得把协议示例枚举当成已确认值。
+- **反馈与线程**：接收线程只保存最新 BasicStatus/MotionStatus，ROS 定时器消费并发布 odom；反馈年龄及积分用单调时钟，ROS stamp 用 ROS 时钟；首次、非正及超过 1s 的 dt 不积分，不发布 TF。退出取消定时器、尝试三次零轴（间隔 0.05s），再停止线程/socket。
 
-> **两条上游文档的悬空引用（已逐条核验，供参考时注意）**：
-> 1. `docs/PORTING.md` 第三节写「现成参考：`sw01_dog_follower/sw01_dog_follower/robot_bridge.py`」，
->    并提到「本项目 SW01」。但 **`sw01_dog_follower` 在本仓库中不存在**（`find . -iname '*sw01*'` 为空，
->    全仓唯一的 `package.xml` 是 `src/rs_follow/package.xml`）——它是作者**另一个仓库**里的包。
->    所以「SW01 零桥接直接可用」这条结论的**代码范例在本仓库里拿不到**。
-> 2. `src/rs_follow/README.md:232` 引用 `docs/SLAM_FASTLIO2_PLAN.md`，该文件**两个分支都不存在**。
->
-> 这两处都是上游文档问题，不影响算法功能，但会影响「照文档走」时的预期。
-> **真正可用的桥接范例只有 main 分支的 `src/m20_bridge/`。**
+> 比例标定及硬急停/实际制动验证应在厂商认可的安全测试环境中单独执行。本次未执行硬件标定；`REPORT.md` 中既有跟随误差是历史仿真/实验结果，不能作为当前机器人比例或实机兼容性证据。
+
+> **历史文档引用说明**：旧版 PORTING 提到的 `sw01_dog_follower` 属于其他仓库，当前指南已改为本仓库 `dog_adapters` / `m20_bridge`。原有 `SLAM_FASTLIO2_PLAN.md` 悬空引用不属于本次输出适配工作。下方保留的分支对比和 REPORT 数据是此前审阅时的历史记录，不是 step2 后工作树的包数量/内容快照。
 
 ### 4.3 第 1 段（输入投影）：换雷达的坑比换底盘更深
 
-`docs/PORTING.md` 把这一节列为第一优先级，而且反复强调 **`height_min` 是第一优先级参数**，理由是逐字的：
+当前默认 `control_frame=base_link`（+x 前、+y 左、+z 上），点云按非零源 stamp 查询完整旋转/平移 TF 后才进入投影，不能以最新 TF 代替测量时刻。`height_min/max` 与 `low_height_min/max` 是控制帧中的显式 z 范围；低位带仅用于障碍且默认关闭。标定须观察变换后的地面、躯干与低障碍，不能用传感器离地高度推导当前带。
 
-> `height_min ≈ -(安装高度) + 余量`，`height_max ≈ 行人高度 - 安装高度`，否则俯视地面的雷达会把地面当障碍触发 `apf_emergency`。
-
-**这是整份文档里最容易被忽略、但最容易导致「一上车就急停」的坑。** 本次 WSL 测试也独立验证了它的重要性：`follow_test.sdf` 里给狗加了**雷达桅杆**把雷达抬高到机体轮廓之上，并且**把默认的 `height_min=-0.40 / height_max=1.80` 覆盖为 `-0.60 / 1.50`**（三个编排脚本 `run_full_verification.sh`、`run_edge_verification.sh`、`run_viz_record.sh` 均如此），正是为了让高度带匹配雷达实际安装高度（z=0.95 m）与行人躯干范围（见 `REPORT.md` 第 1.1 节）。
+**历史 WSL 记录**：`follow_test.sdf` 曾用雷达桅杆及传感器帧高度带 `-0.60 / 1.50`（旧默认 `-0.40 / 1.80`）排除地面。这些数据保留用于解释 `REPORT.md` 的历史结果，不是当前 base_link 高度带或硬件外参标定值。
 
 换雷达的具体做法：
 
@@ -202,11 +192,9 @@ C++17 在 JetPack 5（GCC 9.4）和 JetPack 6（GCC 11.4）上都原生支持。
 | Ouster | `/ouster/points` | 直接改 `input_topic` |
 | Hesai | `/hesai/pandar` | 直接改 `input_topic` |
 
-**坐标系是另一个必做的坑**：`docs/PORTING.md` 明确指出，当前算法**隐含假设「点云坐标系即机体坐标系，且 +x 朝前」**，而 `flip_x` / `flip_y` 两个参数**只能处理轴翻转，处理不了安装位置偏移和安装旋转**。正确做法是引入 TF：
+TF 查询与逐点旋转/平移已实现，无需 PCL。通过测量 URDF/TF 配置外参，投影与控制器使用同一归一化自遮挡盒，先滤自身点再取 bin 最近点。绑定点必须有有效非零 stamp/frame，在请求时间变换后按事务提交；失败保留目标，不自动使能。云布局、stamp 或 TF 失败立即六分量归零、清缓存并暂停，恢复要求新鲜输入与显式重新启用。
 
-> 加 `base_frame` / `use_tf` 参数 + `tf2_ros::Buffer` + `tf2::doTransform`，并增加 `tf2_ros` / `tf2_sensor_msgs` / `pcl_ros` 依赖。
-
-**这里有一个重要提醒**：这个改造会**打破「零 PCL 依赖」的现状**（`tf2_sensor_msgs` 用 PCL 做点云变换）。如果雷达可以做到「正装、+x 朝前」，建议先用参数凑合、保住零 PCL；如果雷达到底是斜装的，那就接受引入 PCL，或者自己手写一个 `PointCloud2 → 变换 → PointCloud2` 的变换（用 `sensor_msgs::PointCloud2Iterator` 逐点乘 4×4 矩阵，约 50 行，无 PCL 依赖）。**本项目作为一个小型算法项目，我推荐后者。**
+真实源点可视化 `/rs_follow/cloud_viz` 使用控制帧和源 stamp，包含带外点、排除自身点；0.1 m 体素、最多 6000 点、订阅者驱动、最多 5 Hz。合成 `rslidar` 同帧配置仅用于软件回环；硬件外参与高度带缺失时必须保持 inactive。
 
 ---
 
@@ -216,23 +204,23 @@ C++17 在 JetPack 5（GCC 9.4）和 JetPack 6（GCC 11.4）上都原生支持。
 1. 确认模块是 **Xavier NX 还是 Orin NX**（第 1 节，这决定后续路径）。
 2. 装 ROS 2 Humble：Orin NX → `apt`；Xavier NX → Docker 或源码编译。
 3. `git clone` + 切 `algo-only` 分支（本次验证用的分支，**排除了 M20 私有协议，纯算法**）。
-4. `colcon build`。**预期零依赖报错**——因为只需那 6 个消息包。
+4. 按当前 package/CMake 依赖安装并 `colcon build`；本次四包构建通过不等于 Jetson 已实测。
 
 ### 阶段 2：雷达接入（1 天）
 5. 装雷达驱动（RoboSense → `rslidar_sdk`；Livox → `livox_ros_driver2`）。
 6. **先只验证传感器**：`ros2 topic hz /rslidar_points` 看频率，跑 `pointcloud_status.py` 看点云健康度。
-7. **标定 `height_min` / `height_max`**：用卷尺量雷达离地高度 `h`。设 `height_min = -h + 0.2`（留余量），`height_max = 1.8 - h`。**这一步没做对，后面全是急停。**
-8. 如果雷达斜装 → 按第 4.3 节加变换。
+7. 测量完整安装旋转/平移并发布 TF；在 `control_frame=base_link` 中实测目标带、低障碍带、地面和机体自遮挡盒，未完成前保持 `active=false`、低位带关闭。
+8. 确认每帧源 stamp 的 TF 可用，检查控制帧扫描/真实源点可视化和带 stamp 绑定；同帧合成回环不能替代该检查。
 
 ### 阶段 3：桥接接入（1–3 天，取决于机器人类型）
 9. 判断目标机器人属于 A/B/C 哪一类（第 4.2 节）。
-10. A 类：只改 `cmd_vel_topic`，收工。
-11. B/C 类：**以 `m20_bridge` 为模板写新桥接**，务必包含：
-    - `full_scale_x/y/yaw` 量纲映射（并实车标定）；
-    - **看门狗超时归零**（安全底线，不可省）；
-    - 状态门控（机器人不处于可接受指令的状态时不发速度）；
-    - `/odom` 回传（若 SDK 不给，从轴反馈积分）。
-12. 在**架空/吊装**状态下先验证桥接：发 `cmd_vel`，看轮子/腿是否按预期动作，方向对不对（**符号错了会直接冲向人或退向墙**）。
+10. A 类：配置现有 `twist_adapter`，确认控制入口需要 Twist 还是 TwistStamped，避免输入/输出 remap 成同一话题。
+11. Unitree：配置官方依赖与权限后使用 `unitree_adapter`，显式 arm、新速度指令和 0.3s watchdog；M20：使用 `m20_bridge`，确认安全状态、枚举和比例。其他 B/C 接口仍需桥接，务必包含：
+    - 物理量到厂商指令的量纲映射，并安全实车标定；
+    - 单调时钟看门狗、急停清缓存和恢复后新指令；
+    - 状态门控（未知或不安全时不允许运动）；
+    - `/odom` 回传（若 SDK 不给，从有效反馈积分）。
+12. 先做无硬件回环，再按厂商认可的隔离/支撑方式验证动作、方向和硬急停。当前 step2 仅完成前者，不能据 smoke 推断腿/轮子的真实动作。
 
 ### 阶段 4：实车调试（1–2 天）
 13. **先关跟随、只测急停**：手动推障碍物到雷达前 0.35 m 内，确认机器狗停住。这是**必须最先确认**的功能。
@@ -252,14 +240,14 @@ C++17 在 JetPack 5（GCC 9.4）和 JetPack 6（GCC 11.4）上都原生支持。
 | 雷达接入 | 0.5–1 天 | 驱动 arm64 编译；CustomMsg 格式 | 优先选有官方 arm64 支持的雷达 |
 | `height_min/max` 标定 | 1 h | **高**：错了会全程急停 | 用卷尺量安装高度，按公式设 |
 | TF / 外参 | 0–1 天 | 中：斜装雷达必须处理 | 优先正装；否则手写点云变换保零 PCL |
-| 底盘桥接（A 类） | 分钟级 | 低 | 只改参数 |
-| 底盘桥接（B/C 类） | 1–3 天 | 中：私有协议需逆向/查文档 | 照抄 `m20_bridge` 的四要素 |
+| 底盘桥接（A 类） | 配置及现场确认 | 控制入口/消息类型不匹配 | 使用现有 Twist/TwistStamped 适配器并核对话题 |
+| 底盘桥接（B/C 类） | 现有适配器配置或新协议实现 | 型号权限、枚举、比例不明 | 优先复用 Unitree/M20 实现；其他协议仍需按接口开发 |
 | `full_scale` 实车标定 | 半天 | 中：直接影响稳态误差 | README 已给卷尺标定法 |
 | 急停验证 | 0.5 天 | **高（安全）** | 架空先验，实车再验；必须最先做 |
 
 **总体判断**：
 - **迁移到 Jetson**：**低风险、低成本**。算法纯 CPU、28 MB 内存、依赖极简、无 GPU 需求，Jetson 16 GB 的算力对它是严重过剩。唯一的真实变数是 Xavier NX 的 Ubuntu 20.04。
-- **「通用所有机器人」**：**架构方向正确，但不是免费的**。它是一个**每接一款新机器人需要 1–3 天适配**的方案，而**不是**一个「装上就通吃」的方案。真正需要投入的，是把第 4 节的「三段式适配层」**固化成接口约定 + 桥接模板 + 标定流程**，让每接一款新机器人的成本从「重新理解整个系统」降到「填三个 `full_scale` 数字、量一次雷达高度」。**`m20_bridge` 已经就是这个模板的第一个实例——把它抽成通用骨架，是这个仓库走向「通用」最值得做的一步。**
+- **「通用所有机器人」**：架构解耦不等于所有型号即插即用。当前已有 `dog_adapters` 共用安全门控、Twist/TwistStamped 和官方 Unitree Sport 输出，以及 M20 basic_server 适配；其他协议仍需真实实现。每个新平台仍须确认控制接口、权限、状态、枚举和比例，验证物理急停/制动与雷达安装。统一 `follow_stack` 用显式 YAML 选择一个输出并保持 inactive 启动；已完成的无硬件 smoke 不能替代目标机与现场验证。
 
 ---
 
@@ -268,13 +256,15 @@ C++17 在 JetPack 5（GCC 9.4）和 JetPack 6（GCC 11.4）上都原生支持。
 | 文件 | 作用 | 分支 |
 |---|---|---|
 | `src/rs_follow/README.md` | 话题表、参数、状态机、自带脚本 | main / algo-only |
-| `src/rs_follow/config/follow_params.yaml` | **全部可调参数**（86 行），迁移时的首选调整入口 | main / algo-only |
-| `src/rs_follow/docs/PORTING.md` | **换雷达 / 换底盘 / TF 的官方指引**（7918 字节） | main / algo-only（**两分支完全相同**） |
+| `src/rs_follow/config/follow_params.yaml` | 算法可调参数；适配器参数另见根 README | main / algo-only（历史分支） |
+| `src/rs_follow/docs/PORTING.md` | 换雷达 / 换底盘 / TF 指引；输出章节已更新 | 当前工作树 |
 | `src/rs_follow/launch/follow.launch.py` | 可同时拉起雷达驱动（`with_lidar` 参数） | main / algo-only（**两分支完全相同**） |
 | `src/m20_bridge/README.md` | M20 协议表 + `fake_m20_server` 回环自测法 + `full_scale` 标定法 | **仅 main** |
 | `src/m20_bridge/m20_bridge/bridge_node.py` | **B 类桥接的完整范例**（看门狗、量纲映射、状态门控、odom 回传） | **仅 main** |
 | `src/m20_bridge/m20_bridge/protocol.py` | APDU 编解码 | **仅 main** |
+| `src/dog_adapters/dog_adapters/` | 共用 CommandGate、Twist / TwistStamped、官方 Unitree Sport 适配 | 当前 step2 工作树 |
 
+> 以下为此前审阅的**历史分支快照**，保留原始记录；不能用于描述加入 `dog_adapters` 后的当前工作树。
 > **分支差异提醒（已逐条核验）**：`git diff --name-status main algo-only` 的输出**只有 9 个 `D`（deleted）条目，全部位于 `src/m20_bridge/`**：
 > ```
 > D  src/m20_bridge/README.md                      D  src/m20_bridge/package.xml

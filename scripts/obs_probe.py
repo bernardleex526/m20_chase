@@ -20,10 +20,10 @@ from sensor_msgs.msg import PointCloud2
 DTYPE = {1: np.int8, 2: np.uint8, 3: np.int16, 4: np.uint16,
          5: np.int32, 6: np.uint32, 7: np.float32, 8: np.float64}
 
-# must match run_scenarios.sh
-SENSOR_H = 0.75          # MEASURED: the body settles, so the lidar ends at ~0.75
+# Same-frame simulation settings must match run_obs_probe.sh; no installation TF.
+SENSOR_H = 0.75          # MEASURED simulation floor offset, only for diagnostic labels
 HEIGHT_MIN, HEIGHT_MAX = -0.40, 1.50
-GROUND_CLEARANCE = 0.10
+LOW_HEIGHT_MIN, LOW_HEIGHT_MAX = -0.65, -0.42
 FRAME_FRONT = 0.31 + 0.08
 FRAME_BACK = 0.31 + 0.08
 FRAME_LEFT = 0.18 + 0.08
@@ -70,15 +70,17 @@ class Probe(Node):
         r = np.hypot(x, y)
         az = np.arctan2(y, x)
 
-        low_lo = -SENSOR_H + GROUND_CLEARANCE
-        low_hi = HEIGHT_MIN - 0.05
-        print(f"sensor_height={SENSOR_H}  low band=[{low_lo:+.2f},{low_hi:+.2f}]  "
+        low_lo, low_hi = LOW_HEIGHT_MIN, LOW_HEIGHT_MAX
+        print(f"control_frame=rslidar  low band=[{low_lo:+.2f},{low_hi:+.2f}]  "
               f"target band=[{HEIGHT_MIN:+.2f},{HEIGHT_MAX:+.2f}]")
         print(f"total {len(x)} returns; z {z.min():+.3f}..{z.max():+.3f} (sensor frame)")
 
         in_t = (z >= HEIGHT_MIN) & (z <= HEIGHT_MAX)
         in_l = (z >= low_lo) & (z <= low_hi)
         in_r = (r >= RANGE_MIN)
+        # Reject body returns before nearest-bin selection, as the projector does.
+        outside_body = ~((-FRAME_BACK <= x) & (x <= FRAME_FRONT) &
+                         (-FRAME_RIGHT <= y) & (y <= FRAME_LEFT))
         print(f"  target band: {int(in_t.sum()):6d} pts   "
               f"low band: {int(in_l.sum()):6d} pts   r>={RANGE_MIN}: {int(in_r.sum())}")
 
@@ -91,8 +93,8 @@ class Probe(Node):
             np.minimum.at(prof, idx, r[mask])
             return prof
 
-        tgt = scan_of(in_t & in_r)
-        low = scan_of(in_l & in_r)
+        tgt = scan_of(in_t & in_r & outside_body)
+        low = scan_of(in_l & in_r & outside_body)
 
         # what is in the low band, in world terms?
         if (in_l & in_r).any():

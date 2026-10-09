@@ -63,6 +63,8 @@ def run_case(npts, hz, secs, note):
         ["bash", "-lc",
          f"{ROS_SETUP} && exec ros2 run rs_follow rs_follow_node --ros-args "
          f"-p input_topic:=/rslidar_points -p cmd_vel_topic:=/cmd_vel "
+         f"-p control_frame:=rslidar -p height_min:=-0.4 -p height_max:=1.8 "
+         f"-p enable_low_band:=false "
          f"-p odom_topic:=/odom -p publish_scan_debug:=true -p active:=false"],
         stdout=open("/tmp/bench_node.log", "w"), stderr=subprocess.STDOUT)
     time.sleep(5)

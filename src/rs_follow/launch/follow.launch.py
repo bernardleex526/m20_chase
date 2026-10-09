@@ -3,12 +3,14 @@ from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
     params_file = LaunchConfiguration('params_file')
     active = LaunchConfiguration('active')
+    control_frame = LaunchConfiguration('control_frame')
     with_lidar = LaunchConfiguration('with_lidar')
 
     # Optional: start the RoboSense SDK driver (no RViz) in the same launch.
@@ -25,7 +27,10 @@ def generate_launch_description():
         executable='rs_follow_node',
         name='rs_follow_node',
         output='screen',
-        parameters=[params_file, {'active': active}],
+        parameters=[params_file, {
+            'active': ParameterValue(active, value_type=bool),
+            'control_frame': ParameterValue(control_frame, value_type=str),
+        }],
     )
 
     return LaunchDescription([
@@ -38,6 +43,9 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'active', default_value='false',
             description='enable the follow controller at startup'),
+        DeclareLaunchArgument(
+            'control_frame', default_value='base_link',
+            description='body-aligned control frame; measured stamped TF required for other cloud frames'),
         DeclareLaunchArgument(
             'with_lidar', default_value='false',
             description='also launch the RoboSense rslidar_sdk driver'),

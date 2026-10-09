@@ -17,6 +17,7 @@ p = PointStamped()
 p.header.frame_id = "rslidar"
 p.point.x, p.point.y = 3.0, 0.0
 for _ in range(5):
+    p.header.stamp = n.get_clock().now().to_msg()
     bp.publish(p)
     time.sleep(0.1)
 

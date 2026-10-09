@@ -17,6 +17,9 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(rs_follow_interfaces REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
 
 include_directories(include)
 
@@ -32,7 +35,10 @@ ament_target_dependencies(rs_follow_node
   geometry_msgs
   nav_msgs
   visualization_msgs
-  std_msgs)
+  std_msgs
+  tf2
+  tf2_ros
+  rs_follow_interfaces)
 
 install(TARGETS rs_follow_node
   DESTINATION lib/${PROJECT_NAME})
@@ -43,6 +49,7 @@ install(TARGETS rs_follow_node
 #     colcon build --packages-select rs_follow --cmake-args -DBUILD_TESTING=ON
 #     ./build/rs_follow/test_safety
 if(BUILD_TESTING)
+  find_package(ament_cmake_test REQUIRED)
   add_executable(test_safety test/test_safety.cpp)
   target_include_directories(test_safety PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
@@ -53,6 +60,9 @@ if(BUILD_TESTING)
     nav_msgs
     visualization_msgs
     std_msgs)
+  ament_add_test(test_safety
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    COMMAND $<TARGET_FILE:test_safety>)
 
   # Auto-select must pick a person, not a wall (it once locked a trap's back
   # wall and held station on it while the person stood 4.5 m away).
@@ -66,6 +76,33 @@ if(BUILD_TESTING)
     nav_msgs
     visualization_msgs
     std_msgs)
+  ament_add_test(test_autoselect
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    COMMAND $<TARGET_FILE:test_autoselect>)
+
+  add_executable(test_projection test/test_projection.cpp)
+  target_include_directories(test_projection PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  ament_target_dependencies(test_projection rclcpp sensor_msgs geometry_msgs)
+  ament_add_test(test_projection
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    COMMAND $<TARGET_FILE:test_projection>)
+
+  add_executable(test_binding test/test_binding.cpp)
+  target_include_directories(test_binding PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  ament_target_dependencies(test_binding rclcpp sensor_msgs geometry_msgs)
+  ament_add_test(test_binding
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    COMMAND $<TARGET_FILE:test_binding>)
+
+  add_executable(test_time test/test_time.cpp)
+  target_include_directories(test_time PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  ament_target_dependencies(test_time rclcpp sensor_msgs geometry_msgs)
+  ament_add_test(test_time
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    COMMAND $<TARGET_FILE:test_time>)
 
   # Prints the speed-vs-clearance curve, so the safety margins are chosen from
   # numbers instead of by trial and error in simulation.
@@ -78,9 +115,10 @@ install(PROGRAMS
   scripts/pointcloud_status.py
   scripts/follow_scenario_test.py
   scripts/control_smoothness_check.py
+  scripts/follow_acceptance.py
+  scripts/coordinate_acceptance.py
   scripts/follow_sim_visualize.py
   scripts/follow_pysim.py
-  scripts/web_target_ui.py
   scripts/web_ui.py
   scripts/ws_server.py
   DESTINATION lib/${PROJECT_NAME})

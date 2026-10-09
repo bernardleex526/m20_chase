@@ -138,6 +138,7 @@ def main():
     p.header.frame_id = "rslidar"
     p.point.x, p.point.y = TARGET_XY
     for _ in range(5):
+        p.header.stamp = node.get_clock().now().to_msg()
         node.bind_pub.publish(p)
         time.sleep(0.08)
     node.en_pub.publish(Bool(data=True))
